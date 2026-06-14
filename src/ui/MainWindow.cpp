@@ -1,12 +1,28 @@
 #include "ui/MainWindow.h"
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QFormLayout>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QMessageBox>
+#include <QRegularExpression>
+#include <QTextEdit>
 #include <QStatusBar>
+#include <QStringList>
 #include <QVBoxLayout>
+
+#include <array>
+
+namespace {
+constexpr std::array<const char *, 26> ArmingFlagNames = {
+    "NO_GYRO", "FAILSAFE", "RX_FAILSAFE", "BAD_RX_RECOVERY", "BOXFAILSAFE", "RUNAWAY_TAKEOFF",
+    "CRASH_DETECTED", "THROTTLE", "ANGLE", "BOOT_GRACE_TIME", "NOPREARM", "LOAD",
+    "CALIBRATING", "CLI", "CMS_MENU", "BST", "MSP", "PARALYZE", "GPS", "RESC",
+    "RPMFILTER", "REBOOT_REQUIRED", "DSHOT_BITBANG", "ACC_CALIBRATION", "MOTOR_PROTOCOL", "ARM_SWITCH",
+};
+}
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 {
@@ -18,42 +34,17 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 
     auto *tabs = new QTabWidget(central);
     tabs->addTab(buildDashboardTab(), QStringLiteral("Dashboard"));
-    tabs->addTab(buildPlaceholderTab(QStringLiteral("Setup Wizard"), {
-        QStringLiteral("ESP32-S3 + BMI160 I2C preset"),
-        QStringLiteral("SBUS/CRSF receiver preset"),
-        QStringLiteral("PWM motor preset on GPIO39-42"),
-        QStringLiteral("AUX1 arm switch preset"),
-    }), QStringLiteral("Setup"));
-    tabs->addTab(buildPlaceholderTab(QStringLiteral("Receiver"), {
-        QStringLiteral("Read/write serial RX provider with MSP_RX_CONFIG / MSP_SET_RX_CONFIG"),
-        QStringLiteral("Warn when more than one UART has RX_SERIAL"),
-        QStringLiteral("Show channel activity and failsafe state"),
-    }), QStringLiteral("Receiver"));
-    tabs->addTab(buildPlaceholderTab(QStringLiteral("Motors"), {
-        QStringLiteral("PWM/DSHOT protocol, rate, min/max throttle"),
-        QStringLiteral("QUADX motor order diagram: RR, FR, RL, FL"),
-        QStringLiteral("Safety-gated motor tests with props-off confirmation"),
-    }), QStringLiteral("Motors"));
-    tabs->addTab(buildPlaceholderTab(QStringLiteral("PID"), {
-        QStringLiteral("Roll/pitch/yaw PID and feed-forward values"),
-        QStringLiteral("Level and altitude-hold groups"),
-        QStringLiteral("Import/export tuning profiles"),
-    }), QStringLiteral("PID"));
-    tabs->addTab(buildPlaceholderTab(QStringLiteral("Filters"), {
-        QStringLiteral("Gyro LPF, LPF2, LPF3, static notches"),
-        QStringLiteral("D-term filters and dynamic filter ranges"),
-        QStringLiteral("Beginner/moderate/strong filter presets"),
-    }), QStringLiteral("Filters"));
+    tabs->addTab(buildSetupTab(), QStringLiteral("Setup"));
+    tabs->addTab(buildReceiverTab(), QStringLiteral("Receiver"));
+    tabs->addTab(buildMotorsTab(), QStringLiteral("Motors"));
+    tabs->addTab(buildPidTab(), QStringLiteral("PID"));
+    tabs->addTab(buildFiltersTab(), QStringLiteral("Filters"));
     tabs->addTab(buildPlaceholderTab(QStringLiteral("Rates"), {
         QStringLiteral("Roll/pitch/yaw rate, super-rate, expo, limits"),
         QStringLiteral("Throttle smoothing guidance through radio curves and mixer limit"),
         QStringLiteral("Beginner preset for reduced sensitivity"),
     }), QStringLiteral("Rates"));
-    tabs->addTab(buildPlaceholderTab(QStringLiteral("Sensors / 3D"), {
-        QStringLiteral("MSP_ATTITUDE 3D model"),
-        QStringLiteral("MSP_RAW_IMU gravity vector"),
-        QStringLiteral("gyro_align assistant and calibration commands"),
-    }), QStringLiteral("Sensors"));
+    tabs->addTab(buildSensorsTab(), QStringLiteral("Sensors"));
     tabs->addTab(buildCliTab(), QStringLiteral("CLI"));
 
     layout->addWidget(tabs, 1);
@@ -64,9 +55,20 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
         m_cliOutput->moveCursor(QTextCursor::End);
         m_cliOutput->insertPlainText(text);
         m_cliOutput->moveCursor(QTextCursor::End);
+        captureCliText(text);
     });
-    connect(&m_msp, &MspCodec::messageReceived, this, &MainWindow::handleMspMessage);
-    connect(&m_msp, &MspCodec::parseError, this, &MainWindow::appendLog);
+    connect(&m_cli, &CliSession::activeChanged, this, [this](bool active) {
+        if (active) {
+            flushPendingCliCommands();
+        }
+    });
+    connect(&m_msp, &MspClient::messageReceived, this, &MainWindow::handleMspMessage);
+    connect(&m_msp, &MspClient::parseError, this, &MainWindow::appendLog);
+    connect(&m_msp, &MspClient::requestFailed, this, [this](quint16 command, const QString &error) {
+        appendLog(QStringLiteral("%1 failed: %2").arg(MspCodec::commandName(command), error));
+    });
+    m_sensorPollTimer.setInterval(100);
+    connect(&m_sensorPollTimer, &QTimer::timeout, this, &MainWindow::requestSensorFrame);
 
     refreshSerialPorts();
     setConnectedUi(false);
@@ -113,8 +115,12 @@ QWidget *MainWindow::buildDashboardTab()
 
     auto *actions = new QHBoxLayout();
     auto *statusButton = new QPushButton(QStringLiteral("Request MSP Status"), page);
+    auto *handshakeButton = new QPushButton(QStringLiteral("Handshake"), page);
+    auto *loadDump = new QPushButton(QStringLiteral("Load Config Dump"), page);
     auto *cliButton = new QPushButton(QStringLiteral("Enter CLI"), page);
     actions->addWidget(statusButton);
+    actions->addWidget(handshakeButton);
+    actions->addWidget(loadDump);
     actions->addWidget(cliButton);
     actions->addStretch();
     layout->addLayout(actions);
@@ -132,7 +138,580 @@ QWidget *MainWindow::buildDashboardTab()
     layout->addStretch();
 
     connect(statusButton, &QPushButton::clicked, this, &MainWindow::requestStatus);
+    connect(handshakeButton, &QPushButton::clicked, this, &MainWindow::requestHandshake);
+    connect(loadDump, &QPushButton::clicked, this, &MainWindow::loadConfigDump);
     connect(cliButton, &QPushButton::clicked, this, &MainWindow::enterCli);
+    return page;
+}
+
+QWidget *MainWindow::buildSetupTab()
+{
+    auto *page = new QWidget(this);
+    auto *layout = new QVBoxLayout(page);
+
+    auto *configBox = new QGroupBox(QStringLiteral("Configuration Store"), page);
+    auto *configLayout = new QVBoxLayout(configBox);
+    m_configSummary = new QLabel(QStringLiteral("No config dump loaded"), configBox);
+    auto *configButtons = new QHBoxLayout();
+    auto *loadDump = new QPushButton(QStringLiteral("Load Dump"), configBox);
+    m_applyConfig = new QPushButton(QStringLiteral("Write to FC && Reboot"), configBox);
+    configButtons->addWidget(loadDump);
+    configButtons->addWidget(m_applyConfig);
+    configButtons->addStretch();
+    configLayout->addWidget(m_configSummary);
+    configLayout->addLayout(configButtons);
+
+    auto *presetBox = new QGroupBox(QStringLiteral("Current ESP32-S3 Build Presets"), page);
+    auto *presetLayout = new QVBoxLayout(presetBox);
+    auto *presetButtons = new QHBoxLayout();
+    auto *boardPreset = new QPushButton(QStringLiteral("ESP32-S3 Pins"), presetBox);
+    auto *imuPreset = new QPushButton(QStringLiteral("GY-BMI160 I2C"), presetBox);
+    auto *rxSbusPreset = new QPushButton(QStringLiteral("ELRS SBUS Serial2"), presetBox);
+    auto *rxCrsfPreset = new QPushButton(QStringLiteral("ELRS CRSF Serial2"), presetBox);
+    auto *pwmPreset = new QPushButton(QStringLiteral("PWM QuadX"), presetBox);
+    auto *armPreset = new QPushButton(QStringLiteral("AUX1 High Arm"), presetBox);
+    presetButtons->addWidget(boardPreset);
+    presetButtons->addWidget(imuPreset);
+    presetButtons->addWidget(rxSbusPreset);
+    presetButtons->addWidget(rxCrsfPreset);
+    presetButtons->addWidget(pwmPreset);
+    presetButtons->addWidget(armPreset);
+    presetButtons->addStretch();
+    auto *presetNote = new QLabel(QStringLiteral(
+        "Presets update the local config store first. Click Write to FC && Reboot to apply, save, and restart."), presetBox);
+    presetNote->setWordWrap(true);
+    presetLayout->addLayout(presetButtons);
+    presetLayout->addWidget(presetNote);
+
+    auto *validationBox = new QGroupBox(QStringLiteral("Setup Validation"), page);
+    auto *validationLayout = new QVBoxLayout(validationBox);
+    m_setupValidation = new QLabel(QStringLiteral("Load a dump to validate setup."), validationBox);
+    m_setupValidation->setWordWrap(true);
+    validationLayout->addWidget(m_setupValidation);
+
+    layout->addWidget(configBox);
+    layout->addWidget(presetBox);
+    layout->addWidget(validationBox);
+    layout->addStretch();
+
+    connect(loadDump, &QPushButton::clicked, this, &MainWindow::loadConfigDump);
+    connect(m_applyConfig, &QPushButton::clicked, this, &MainWindow::writeSaveReboot);
+    connect(boardPreset, &QPushButton::clicked, this, [this]() {
+        m_config.setInt(QStringLiteral("pin_i2c_scl"), 10);
+        m_config.setInt(QStringLiteral("pin_i2c_sda"), 9);
+        m_config.setInt(QStringLiteral("pin_output_0"), 39);
+        m_config.setInt(QStringLiteral("pin_output_1"), 40);
+        m_config.setInt(QStringLiteral("pin_output_2"), 41);
+        m_config.setInt(QStringLiteral("pin_output_3"), 42);
+        m_config.setInt(QStringLiteral("pin_serial_2_rx"), 17);
+        m_config.setInt(QStringLiteral("pin_serial_2_tx"), 18);
+        updateConfigUi();
+    });
+    connect(imuPreset, &QPushButton::clicked, this, [this]() {
+        m_config.setValue(QStringLiteral("gyro_bus"), QStringLiteral("I2C"));
+        m_config.setValue(QStringLiteral("gyro_dev"), QStringLiteral("BMI160"));
+        m_config.setValue(QStringLiteral("accel_bus"), QStringLiteral("I2C"));
+        m_config.setValue(QStringLiteral("accel_dev"), QStringLiteral("BMI160"));
+        updateConfigUi();
+    });
+    connect(rxSbusPreset, &QPushButton::clicked, this, [this]() {
+        m_config.setBool(QStringLiteral("feature_rx_serial"), true);
+        m_config.setBool(QStringLiteral("feature_rx_ppm"), false);
+        m_config.setBool(QStringLiteral("feature_rx_spi"), false);
+        m_config.set(QStringLiteral("serial_2"), {QStringLiteral("64"), QStringLiteral("115200"), QStringLiteral("0")});
+        m_config.setInt(QStringLiteral("pin_serial_2_rx"), 17);
+        m_config.setInt(QStringLiteral("pin_serial_2_tx"), 18);
+        m_rxProvider->setCurrentIndex(m_rxProvider->findData(RxConfig::Sbus));
+        appendLog(QStringLiteral("SBUS provider selected. Use Receiver > Apply Provider to write serialrx_provider."));
+        updateConfigUi();
+    });
+    connect(rxCrsfPreset, &QPushButton::clicked, this, [this]() {
+        m_config.setBool(QStringLiteral("feature_rx_serial"), true);
+        m_config.setBool(QStringLiteral("feature_rx_ppm"), false);
+        m_config.setBool(QStringLiteral("feature_rx_spi"), false);
+        m_config.set(QStringLiteral("serial_2"), {QStringLiteral("64"), QStringLiteral("115200"), QStringLiteral("0")});
+        m_config.setInt(QStringLiteral("pin_serial_2_rx"), 17);
+        m_config.setInt(QStringLiteral("pin_serial_2_tx"), 18);
+        m_rxProvider->setCurrentIndex(m_rxProvider->findData(RxConfig::Crsf));
+        appendLog(QStringLiteral("CRSF provider selected. Use Receiver > Apply Provider to write serialrx_provider."));
+        updateConfigUi();
+    });
+    connect(pwmPreset, &QPushButton::clicked, this, [this]() {
+        m_config.setValue(QStringLiteral("mixer_type"), QStringLiteral("QUADX"));
+        m_config.setInt(QStringLiteral("mix_outputs"), 4);
+        m_config.setValue(QStringLiteral("output_motor_protocol"), QStringLiteral("PWM"));
+        m_config.setInt(QStringLiteral("output_motor_rate"), 50);
+        m_config.setInt(QStringLiteral("output_min_command"), 1000);
+        m_config.setInt(QStringLiteral("output_min_throttle"), 1070);
+        m_config.setInt(QStringLiteral("output_max_throttle"), 2000);
+        for (int i = 0; i < 4; ++i) {
+            m_config.set(QStringLiteral("output_%1").arg(i), {QStringLiteral("M"), QStringLiteral("N"), QStringLiteral("1000"), QStringLiteral("1500"), QStringLiteral("2000")});
+        }
+        updateConfigUi();
+    });
+    connect(armPreset, &QPushButton::clicked, this, [this]() {
+        m_config.set(QStringLiteral("mode_0"), {QStringLiteral("0"), QStringLiteral("4"), QStringLiteral("1700"), QStringLiteral("2100"), QStringLiteral("0"), QStringLiteral("0")});
+        updateConfigUi();
+    });
+
+    return page;
+}
+
+QWidget *MainWindow::buildReceiverTab()
+{
+    auto *page = new QWidget(this);
+    auto *layout = new QVBoxLayout(page);
+
+    auto *providerBox = new QGroupBox(QStringLiteral("Serial Receiver Provider"), page);
+    auto *form = new QFormLayout(providerBox);
+    m_rxProvider = new QComboBox(providerBox);
+    m_rxProvider->addItem(QStringLiteral("SBUS"), RxConfig::Sbus);
+    m_rxProvider->addItem(QStringLiteral("IBUS"), RxConfig::Ibus);
+    m_rxProvider->addItem(QStringLiteral("CRSF / ELRS"), RxConfig::Crsf);
+    m_rxSummary = new QLabel(QStringLiteral("Not loaded"), providerBox);
+    form->addRow(QStringLiteral("Provider"), m_rxProvider);
+    form->addRow(QStringLiteral("Current config"), m_rxSummary);
+
+    auto *buttons = new QHBoxLayout();
+    auto *read = new QPushButton(QStringLiteral("Read RX Config"), page);
+    m_rxApply = new QPushButton(QStringLiteral("Apply Provider"), page);
+    auto *write = new QPushButton(QStringLiteral("Write to FC && Reboot"), page);
+    buttons->addWidget(read);
+    buttons->addWidget(m_rxApply);
+    buttons->addWidget(write);
+    buttons->addStretch();
+
+    auto *note = new QLabel(QStringLiteral(
+        "Provider changes use MSP_RX_CONFIG/MSP_SET_RX_CONFIG because ESP-FC CLI does not expose serialrx_provider. "
+        "Click Write to FC && Reboot after changing SBUS/IBUS/CRSF."), page);
+    note->setWordWrap(true);
+
+    layout->addWidget(providerBox);
+    layout->addLayout(buttons);
+    layout->addWidget(note);
+    layout->addStretch();
+
+    connect(read, &QPushButton::clicked, this, &MainWindow::requestRxConfig);
+    connect(m_rxApply, &QPushButton::clicked, this, &MainWindow::applyRxProvider);
+    connect(write, &QPushButton::clicked, this, &MainWindow::writeSaveReboot);
+    return page;
+}
+
+QWidget *MainWindow::buildMotorsTab()
+{
+    auto *page = new QWidget(this);
+    auto *layout = new QVBoxLayout(page);
+
+    auto *configBox = new QGroupBox(QStringLiteral("Motor Output Configuration"), page);
+    auto *form = new QFormLayout(configBox);
+    m_motorProtocol = new QComboBox(configBox);
+    m_motorProtocol->addItems({QStringLiteral("DISABLED"), QStringLiteral("PWM"), QStringLiteral("ONESHOT125"), QStringLiteral("ONESHOT42"), QStringLiteral("DSHOT150"), QStringLiteral("DSHOT300"), QStringLiteral("DSHOT600")});
+    m_motorRate = new QSpinBox(configBox);
+    m_motorRate->setRange(0, 8000);
+    m_motorRate->setSuffix(QStringLiteral(" Hz"));
+    m_minCommand = new QSpinBox(configBox);
+    m_minCommand->setRange(750, 2250);
+    m_minThrottle = new QSpinBox(configBox);
+    m_minThrottle->setRange(750, 2250);
+    m_maxThrottle = new QSpinBox(configBox);
+    m_maxThrottle->setRange(750, 2250);
+    m_outputLimit = new QSpinBox(configBox);
+    m_outputLimit->setRange(1, 100);
+    m_outputLimit->setSuffix(QStringLiteral(" %"));
+    m_throttleLimitType = new QComboBox(configBox);
+    m_throttleLimitType->addItems({QStringLiteral("NONE"), QStringLiteral("SCALE"), QStringLiteral("CLIP")});
+    m_throttleLimitPercent = new QSpinBox(configBox);
+    m_throttleLimitPercent->setRange(1, 100);
+    m_throttleLimitPercent->setSuffix(QStringLiteral(" %"));
+
+    form->addRow(QStringLiteral("Protocol"), m_motorProtocol);
+    form->addRow(QStringLiteral("PWM/analog rate"), m_motorRate);
+    form->addRow(QStringLiteral("Min command"), m_minCommand);
+    form->addRow(QStringLiteral("Min throttle"), m_minThrottle);
+    form->addRow(QStringLiteral("Max throttle"), m_maxThrottle);
+    form->addRow(QStringLiteral("Output limit"), m_outputLimit);
+    form->addRow(QStringLiteral("Throttle limit type"), m_throttleLimitType);
+    form->addRow(QStringLiteral("Throttle limit percent"), m_throttleLimitPercent);
+
+    auto *pinsBox = new QGroupBox(QStringLiteral("ESP32-S3 Motor Pins"), page);
+    auto *pins = new QGridLayout(pinsBox);
+    const QStringList labels = {
+        QStringLiteral("M1 / output_0 / Rear Right"),
+        QStringLiteral("M2 / output_1 / Front Right"),
+        QStringLiteral("M3 / output_2 / Rear Left"),
+        QStringLiteral("M4 / output_3 / Front Left"),
+    };
+    for (int i = 0; i < 4; ++i) {
+        m_motorPins[i] = new QSpinBox(pinsBox);
+        m_motorPins[i]->setRange(-1, 48);
+        pins->addWidget(new QLabel(labels.at(i), pinsBox), i, 0);
+        pins->addWidget(m_motorPins[i], i, 1);
+    }
+
+    auto *diagramBox = new QGroupBox(QStringLiteral("QuadX Motor Order"), page);
+    auto *diagramLayout = new QVBoxLayout(diagramBox);
+    auto *diagram = new QLabel(QStringLiteral(
+        "<pre>          FRONT\n"
+        "   M4 GPIO42       M2 GPIO40\n"
+        "   Front Left      Front Right\n\n"
+        "   M3 GPIO41       M1 GPIO39\n"
+        "   Rear Left       Rear Right\n"
+        "          REAR</pre>"), diagramBox);
+    diagramLayout->addWidget(diagram);
+
+    auto *safety = new QLabel(QStringLiteral(
+        "Motor tests are intentionally not implemented yet. Keep props off and use this page for configuration and validation first."), page);
+    safety->setWordWrap(true);
+
+    m_motorValidation = new QLabel(QStringLiteral("Load a config dump to validate motors."), page);
+    m_motorValidation->setWordWrap(true);
+
+    auto *buttons = new QHBoxLayout();
+    auto *load = new QPushButton(QStringLiteral("Load Dump"), page);
+    auto *preset = new QPushButton(QStringLiteral("PWM QuadX Preset"), page);
+    auto *apply = new QPushButton(QStringLiteral("Stage Motor Fields"), page);
+    auto *write = new QPushButton(QStringLiteral("Write to FC && Reboot"), page);
+    buttons->addWidget(load);
+    buttons->addWidget(preset);
+    buttons->addWidget(apply);
+    buttons->addWidget(write);
+    buttons->addStretch();
+
+    layout->addWidget(configBox);
+    layout->addWidget(pinsBox);
+    layout->addWidget(diagramBox);
+    layout->addWidget(safety);
+    layout->addWidget(m_motorValidation);
+    layout->addLayout(buttons);
+    layout->addStretch();
+
+    connect(load, &QPushButton::clicked, this, &MainWindow::loadConfigDump);
+    connect(preset, &QPushButton::clicked, this, &MainWindow::applyMotorPreset);
+    connect(apply, &QPushButton::clicked, this, &MainWindow::applyMotorsFromUi);
+    connect(write, &QPushButton::clicked, this, &MainWindow::writeSaveReboot);
+    return page;
+}
+
+QWidget *MainWindow::buildPidTab()
+{
+    auto *page = new QWidget(this);
+    auto *layout = new QVBoxLayout(page);
+
+    auto *pidBox = new QGroupBox(QStringLiteral("PID Values"), page);
+    auto *pidGrid = new QGridLayout(pidBox);
+    const QStringList axes = {QStringLiteral("Roll"), QStringLiteral("Pitch"), QStringLiteral("Yaw"), QStringLiteral("Level")};
+    const QStringList terms = {QStringLiteral("P"), QStringLiteral("I"), QStringLiteral("D"), QStringLiteral("F")};
+    for (int col = 0; col < terms.size(); ++col) {
+        pidGrid->addWidget(new QLabel(terms.at(col), pidBox), 0, col + 1);
+    }
+    for (int row = 0; row < axes.size(); ++row) {
+        pidGrid->addWidget(new QLabel(axes.at(row), pidBox), row + 1, 0);
+        for (int col = 0; col < terms.size(); ++col) {
+            m_pid[row][col] = new QSpinBox(pidBox);
+            m_pid[row][col]->setRange(0, col == 3 ? 500 : 300);
+            pidGrid->addWidget(m_pid[row][col], row + 1, col + 1);
+        }
+    }
+
+    auto *filterBox = new QGroupBox(QStringLiteral("D-term / I-term"), page);
+    auto *filterForm = new QFormLayout(filterBox);
+    const QStringList filterTypes = {
+        QStringLiteral("PT1"), QStringLiteral("BIQUAD"), QStringLiteral("PT2"), QStringLiteral("PT3"),
+        QStringLiteral("NOTCH"), QStringLiteral("BPF"), QStringLiteral("FO"), QStringLiteral("NONE"),
+    };
+    m_dtermLpfType = new QComboBox(filterBox);
+    m_dtermLpfType->addItems(filterTypes);
+    m_dtermLpfFreq = new QSpinBox(filterBox);
+    m_dtermLpfFreq->setRange(0, 1000);
+    m_dtermLpfFreq->setSuffix(QStringLiteral(" Hz"));
+    m_dtermLpf2Type = new QComboBox(filterBox);
+    m_dtermLpf2Type->addItems(filterTypes);
+    m_dtermLpf2Freq = new QSpinBox(filterBox);
+    m_dtermLpf2Freq->setRange(0, 1000);
+    m_dtermLpf2Freq->setSuffix(QStringLiteral(" Hz"));
+    m_dtermNotchFreq = new QSpinBox(filterBox);
+    m_dtermNotchFreq->setRange(0, 1000);
+    m_dtermNotchFreq->setSuffix(QStringLiteral(" Hz"));
+    m_dtermNotchCutoff = new QSpinBox(filterBox);
+    m_dtermNotchCutoff->setRange(0, 1000);
+    m_dtermNotchCutoff->setSuffix(QStringLiteral(" Hz"));
+    m_dtermDynMin = new QSpinBox(filterBox);
+    m_dtermDynMin->setRange(0, 1000);
+    m_dtermDynMin->setSuffix(QStringLiteral(" Hz"));
+    m_dtermDynMax = new QSpinBox(filterBox);
+    m_dtermDynMax->setRange(0, 1000);
+    m_dtermDynMax->setSuffix(QStringLiteral(" Hz"));
+    m_itermLimit = new QSpinBox(filterBox);
+    m_itermLimit->setRange(0, 1000);
+    m_itermZero = new QComboBox(filterBox);
+    m_itermZero->addItems({QStringLiteral("0"), QStringLiteral("1")});
+    m_itermRelax = new QComboBox(filterBox);
+    m_itermRelax->addItems({QStringLiteral("OFF"), QStringLiteral("RP"), QStringLiteral("RPY"), QStringLiteral("RP_INC"), QStringLiteral("RPY_INC")});
+    m_itermRelaxCutoff = new QSpinBox(filterBox);
+    m_itermRelaxCutoff->setRange(0, 1000);
+    m_itermRelaxCutoff->setSuffix(QStringLiteral(" Hz"));
+
+    filterForm->addRow(QStringLiteral("D-term LPF type"), m_dtermLpfType);
+    filterForm->addRow(QStringLiteral("D-term LPF freq"), m_dtermLpfFreq);
+    filterForm->addRow(QStringLiteral("D-term LPF2 type"), m_dtermLpf2Type);
+    filterForm->addRow(QStringLiteral("D-term LPF2 freq"), m_dtermLpf2Freq);
+    filterForm->addRow(QStringLiteral("D-term notch freq"), m_dtermNotchFreq);
+    filterForm->addRow(QStringLiteral("D-term notch cutoff"), m_dtermNotchCutoff);
+    filterForm->addRow(QStringLiteral("D-term dyn min"), m_dtermDynMin);
+    filterForm->addRow(QStringLiteral("D-term dyn max"), m_dtermDynMax);
+    filterForm->addRow(QStringLiteral("I-term limit"), m_itermLimit);
+    filterForm->addRow(QStringLiteral("I-term zero"), m_itermZero);
+    filterForm->addRow(QStringLiteral("I-term relax"), m_itermRelax);
+    filterForm->addRow(QStringLiteral("I-term relax cutoff"), m_itermRelaxCutoff);
+
+    auto *tpaBox = new QGroupBox(QStringLiteral("TPA"), page);
+    auto *tpaForm = new QFormLayout(tpaBox);
+    m_tpaScale = new QSpinBox(tpaBox);
+    m_tpaScale->setRange(0, 100);
+    m_tpaScale->setSuffix(QStringLiteral(" %"));
+    m_tpaBreakpoint = new QSpinBox(tpaBox);
+    m_tpaBreakpoint->setRange(1000, 2000);
+    tpaForm->addRow(QStringLiteral("TPA scale"), m_tpaScale);
+    tpaForm->addRow(QStringLiteral("TPA breakpoint"), m_tpaBreakpoint);
+
+    m_pidValidation = new QLabel(QStringLiteral("Load a config dump to validate PID settings."), page);
+    m_pidValidation->setWordWrap(true);
+
+    auto *buttons = new QHBoxLayout();
+    auto *load = new QPushButton(QStringLiteral("Load Dump"), page);
+    auto *beginner = new QPushButton(QStringLiteral("Beginner Soft Preset"), page);
+    auto *stage = new QPushButton(QStringLiteral("Stage PID Fields"), page);
+    auto *write = new QPushButton(QStringLiteral("Write to FC && Reboot"), page);
+    buttons->addWidget(load);
+    buttons->addWidget(beginner);
+    buttons->addWidget(stage);
+    buttons->addWidget(write);
+    buttons->addStretch();
+
+    auto *note = new QLabel(QStringLiteral(
+        "Beginner Soft stages rates/expo/limits instead of changing PID gains, because control feel is usually safer to soften there first."), page);
+    note->setWordWrap(true);
+
+    layout->addWidget(pidBox);
+    layout->addWidget(filterBox);
+    layout->addWidget(tpaBox);
+    layout->addWidget(note);
+    layout->addWidget(m_pidValidation);
+    layout->addLayout(buttons);
+    layout->addStretch();
+
+    connect(load, &QPushButton::clicked, this, &MainWindow::loadConfigDump);
+    connect(beginner, &QPushButton::clicked, this, &MainWindow::applyPidBeginnerPreset);
+    connect(stage, &QPushButton::clicked, this, &MainWindow::stagePidFields);
+    connect(write, &QPushButton::clicked, this, &MainWindow::writeSaveReboot);
+    return page;
+}
+
+QWidget *MainWindow::buildFiltersTab()
+{
+    auto *page = new QWidget(this);
+    auto *layout = new QVBoxLayout(page);
+
+    const QStringList filterTypes = {
+        QStringLiteral("PT1"), QStringLiteral("BIQUAD"), QStringLiteral("PT2"), QStringLiteral("PT3"),
+        QStringLiteral("NOTCH"), QStringLiteral("NOTCH_DF1"), QStringLiteral("BPF"), QStringLiteral("FO"),
+        QStringLiteral("FIR2"), QStringLiteral("MEDIAN3"), QStringLiteral("NONE"),
+    };
+    auto makeFilterCombo = [&filterTypes](QWidget *parent) {
+        auto *combo = new QComboBox(parent);
+        combo->addItems(filterTypes);
+        return combo;
+    };
+    auto makeHzSpin = [](QWidget *parent) {
+        auto *spin = new QSpinBox(parent);
+        spin->setRange(0, 1000);
+        spin->setSuffix(QStringLiteral(" Hz"));
+        return spin;
+    };
+
+    auto *gyroBox = new QGroupBox(QStringLiteral("Gyro Low-Pass Filters"), page);
+    auto *gyroForm = new QFormLayout(gyroBox);
+    m_filterGyroLpfType = makeFilterCombo(gyroBox);
+    m_filterGyroLpfFreq = makeHzSpin(gyroBox);
+    m_filterGyroLpf2Type = makeFilterCombo(gyroBox);
+    m_filterGyroLpf2Freq = makeHzSpin(gyroBox);
+    m_filterGyroLpf3Type = makeFilterCombo(gyroBox);
+    m_filterGyroLpf3Freq = makeHzSpin(gyroBox);
+    gyroForm->addRow(QStringLiteral("Gyro LPF type"), m_filterGyroLpfType);
+    gyroForm->addRow(QStringLiteral("Gyro LPF freq"), m_filterGyroLpfFreq);
+    gyroForm->addRow(QStringLiteral("Gyro LPF2 type"), m_filterGyroLpf2Type);
+    gyroForm->addRow(QStringLiteral("Gyro LPF2 freq"), m_filterGyroLpf2Freq);
+    gyroForm->addRow(QStringLiteral("Gyro LPF3 type"), m_filterGyroLpf3Type);
+    gyroForm->addRow(QStringLiteral("Gyro LPF3 freq"), m_filterGyroLpf3Freq);
+
+    auto *notchBox = new QGroupBox(QStringLiteral("Gyro Static Notches"), page);
+    auto *notchForm = new QFormLayout(notchBox);
+    m_filterGyroNotch1Freq = makeHzSpin(notchBox);
+    m_filterGyroNotch1Cutoff = makeHzSpin(notchBox);
+    m_filterGyroNotch2Freq = makeHzSpin(notchBox);
+    m_filterGyroNotch2Cutoff = makeHzSpin(notchBox);
+    notchForm->addRow(QStringLiteral("Notch 1 freq"), m_filterGyroNotch1Freq);
+    notchForm->addRow(QStringLiteral("Notch 1 cutoff"), m_filterGyroNotch1Cutoff);
+    notchForm->addRow(QStringLiteral("Notch 2 freq"), m_filterGyroNotch2Freq);
+    notchForm->addRow(QStringLiteral("Notch 2 cutoff"), m_filterGyroNotch2Cutoff);
+
+    auto *dynamicBox = new QGroupBox(QStringLiteral("Dynamic Gyro Filtering"), page);
+    auto *dynamicForm = new QFormLayout(dynamicBox);
+    m_filterDynNotch = new QCheckBox(QStringLiteral("Enable dynamic notch feature"), dynamicBox);
+    m_filterGyroDynLpfMin = makeHzSpin(dynamicBox);
+    m_filterGyroDynLpfMax = makeHzSpin(dynamicBox);
+    m_filterGyroDynNotchQ = new QSpinBox(dynamicBox);
+    m_filterGyroDynNotchQ->setRange(0, 1000);
+    m_filterGyroDynNotchCount = new QSpinBox(dynamicBox);
+    m_filterGyroDynNotchCount->setRange(0, 8);
+    m_filterGyroDynNotchMin = makeHzSpin(dynamicBox);
+    m_filterGyroDynNotchMax = makeHzSpin(dynamicBox);
+    dynamicForm->addRow(m_filterDynNotch);
+    dynamicForm->addRow(QStringLiteral("Dynamic LPF min"), m_filterGyroDynLpfMin);
+    dynamicForm->addRow(QStringLiteral("Dynamic LPF max"), m_filterGyroDynLpfMax);
+    dynamicForm->addRow(QStringLiteral("Dynamic notch Q"), m_filterGyroDynNotchQ);
+    dynamicForm->addRow(QStringLiteral("Dynamic notch count"), m_filterGyroDynNotchCount);
+    dynamicForm->addRow(QStringLiteral("Dynamic notch min"), m_filterGyroDynNotchMin);
+    dynamicForm->addRow(QStringLiteral("Dynamic notch max"), m_filterGyroDynNotchMax);
+
+    auto *dtermBox = new QGroupBox(QStringLiteral("D-Term Filters"), page);
+    auto *dtermForm = new QFormLayout(dtermBox);
+    m_filterDtermLpfType = makeFilterCombo(dtermBox);
+    m_filterDtermLpfFreq = makeHzSpin(dtermBox);
+    m_filterDtermLpf2Type = makeFilterCombo(dtermBox);
+    m_filterDtermLpf2Freq = makeHzSpin(dtermBox);
+    m_filterDtermNotchFreq = makeHzSpin(dtermBox);
+    m_filterDtermNotchCutoff = makeHzSpin(dtermBox);
+    m_filterDtermDynLpfMin = makeHzSpin(dtermBox);
+    m_filterDtermDynLpfMax = makeHzSpin(dtermBox);
+    dtermForm->addRow(QStringLiteral("D-term LPF type"), m_filterDtermLpfType);
+    dtermForm->addRow(QStringLiteral("D-term LPF freq"), m_filterDtermLpfFreq);
+    dtermForm->addRow(QStringLiteral("D-term LPF2 type"), m_filterDtermLpf2Type);
+    dtermForm->addRow(QStringLiteral("D-term LPF2 freq"), m_filterDtermLpf2Freq);
+    dtermForm->addRow(QStringLiteral("D-term notch freq"), m_filterDtermNotchFreq);
+    dtermForm->addRow(QStringLiteral("D-term notch cutoff"), m_filterDtermNotchCutoff);
+    dtermForm->addRow(QStringLiteral("D-term dyn min"), m_filterDtermDynLpfMin);
+    dtermForm->addRow(QStringLiteral("D-term dyn max"), m_filterDtermDynLpfMax);
+
+    auto *columns = new QHBoxLayout();
+    auto *left = new QVBoxLayout();
+    auto *right = new QVBoxLayout();
+    left->addWidget(gyroBox);
+    left->addWidget(notchBox);
+    right->addWidget(dynamicBox);
+    right->addWidget(dtermBox);
+    columns->addLayout(left, 1);
+    columns->addLayout(right, 1);
+
+    m_filterValidation = new QLabel(QStringLiteral("Load a config dump to validate filter settings."), page);
+    m_filterValidation->setWordWrap(true);
+
+    auto *buttons = new QHBoxLayout();
+    auto *load = new QPushButton(QStringLiteral("Load Dump"), page);
+    auto *defaults = new QPushButton(QStringLiteral("Default"), page);
+    auto *more = new QPushButton(QStringLiteral("More Filtering"), page);
+    auto *strong = new QPushButton(QStringLiteral("Strong Filtering"), page);
+    auto *lowLatency = new QPushButton(QStringLiteral("Low Latency"), page);
+    auto *stage = new QPushButton(QStringLiteral("Stage Filter Fields"), page);
+    auto *write = new QPushButton(QStringLiteral("Write to FC && Reboot"), page);
+    buttons->addWidget(load);
+    buttons->addWidget(defaults);
+    buttons->addWidget(more);
+    buttons->addWidget(strong);
+    buttons->addWidget(lowLatency);
+    buttons->addWidget(stage);
+    buttons->addWidget(write);
+    buttons->addStretch();
+
+    auto *note = new QLabel(QStringLiteral(
+        "Lower cutoff frequencies add more filtering and delay. Use stronger presets only when motors are noisy or hot; use low latency only on a clean build."), page);
+    note->setWordWrap(true);
+
+    layout->addLayout(columns);
+    layout->addWidget(note);
+    layout->addWidget(m_filterValidation);
+    layout->addLayout(buttons);
+    layout->addStretch();
+
+    connect(load, &QPushButton::clicked, this, &MainWindow::loadConfigDump);
+    connect(defaults, &QPushButton::clicked, this, &MainWindow::applyFilterDefaultPreset);
+    connect(more, &QPushButton::clicked, this, &MainWindow::applyFilterMorePreset);
+    connect(strong, &QPushButton::clicked, this, &MainWindow::applyFilterStrongPreset);
+    connect(lowLatency, &QPushButton::clicked, this, &MainWindow::applyFilterLowLatencyPreset);
+    connect(stage, &QPushButton::clicked, this, &MainWindow::stageFilterFields);
+    connect(write, &QPushButton::clicked, this, &MainWindow::writeSaveReboot);
+    return page;
+}
+
+QWidget *MainWindow::buildSensorsTab()
+{
+    auto *page = new QWidget(this);
+    auto *layout = new QVBoxLayout(page);
+
+    auto *top = new QHBoxLayout();
+    m_attitudeView = new AttitudeView(page);
+    top->addWidget(m_attitudeView, 2);
+
+    auto *readoutBox = new QGroupBox(QStringLiteral("Live MSP Sensors"), page);
+    auto *readoutForm = new QFormLayout(readoutBox);
+    m_sensorLiveLabel = new QLabel(QStringLiteral("Stopped"), readoutBox);
+    m_attitudeLabel = new QLabel(QStringLiteral("No MSP_ATTITUDE data"), readoutBox);
+    m_accelLabel = new QLabel(QStringLiteral("No MSP_RAW_IMU data"), readoutBox);
+    m_gyroLabel = new QLabel(QStringLiteral("No MSP_RAW_IMU data"), readoutBox);
+    m_magLabel = new QLabel(QStringLiteral("No MSP_RAW_IMU data"), readoutBox);
+    readoutForm->addRow(QStringLiteral("Live view"), m_sensorLiveLabel);
+    readoutForm->addRow(QStringLiteral("Attitude"), m_attitudeLabel);
+    readoutForm->addRow(QStringLiteral("Accel"), m_accelLabel);
+    readoutForm->addRow(QStringLiteral("Gyro"), m_gyroLabel);
+    readoutForm->addRow(QStringLiteral("Mag"), m_magLabel);
+    top->addWidget(readoutBox, 1);
+
+    auto *alignBox = new QGroupBox(QStringLiteral("Alignment / Calibration"), page);
+    auto *alignLayout = new QVBoxLayout(alignBox);
+    auto *alignForm = new QFormLayout();
+    m_gyroAlign = new QComboBox(alignBox);
+    m_gyroAlign->addItems({
+        QStringLiteral("DEFAULT"), QStringLiteral("CW0"), QStringLiteral("CW90"), QStringLiteral("CW180"), QStringLiteral("CW270"),
+        QStringLiteral("CW0_FLIP"), QStringLiteral("CW90_FLIP"), QStringLiteral("CW180_FLIP"), QStringLiteral("CW270_FLIP"), QStringLiteral("CUSTOM"),
+    });
+    alignForm->addRow(QStringLiteral("gyro_align"), m_gyroAlign);
+    alignLayout->addLayout(alignForm);
+
+    auto *alignNote = new QLabel(QStringLiteral(
+        "Flat and still: one accel axis should be near +/-2048, the other accel axes near 0, and gyro axes near 0. "
+        "ESP-FC applies gyro_align to both gyro and accelerometer."), alignBox);
+    alignNote->setWordWrap(true);
+    alignLayout->addWidget(alignNote);
+
+    auto *buttons = new QHBoxLayout();
+    auto *start = new QPushButton(QStringLiteral("Start Live"), page);
+    auto *stop = new QPushButton(QStringLiteral("Stop"), page);
+    auto *load = new QPushButton(QStringLiteral("Load Dump"), page);
+    auto *refreshAlign = new QPushButton(QStringLiteral("Refresh gyro_align"), page);
+    auto *stageAlign = new QPushButton(QStringLiteral("Stage gyro_align"), page);
+    auto *write = new QPushButton(QStringLiteral("Write to FC && Reboot"), page);
+    auto *calGyro = new QPushButton(QStringLiteral("Calibrate Gyro"), page);
+    buttons->addWidget(start);
+    buttons->addWidget(stop);
+    buttons->addWidget(load);
+    buttons->addWidget(refreshAlign);
+    buttons->addWidget(stageAlign);
+    buttons->addWidget(write);
+    buttons->addWidget(calGyro);
+    buttons->addStretch();
+
+    layout->addLayout(top);
+    layout->addWidget(alignBox);
+    layout->addLayout(buttons);
+    layout->addStretch();
+
+    connect(start, &QPushButton::clicked, this, &MainWindow::startSensorPolling);
+    connect(stop, &QPushButton::clicked, this, &MainWindow::stopSensorPolling);
+    connect(load, &QPushButton::clicked, this, &MainWindow::loadConfigDump);
+    connect(refreshAlign, &QPushButton::clicked, this, &MainWindow::refreshGyroAlign);
+    connect(stageAlign, &QPushButton::clicked, this, &MainWindow::stageGyroAlign);
+    connect(write, &QPushButton::clicked, this, &MainWindow::writeSaveReboot);
+    connect(calGyro, &QPushButton::clicked, this, &MainWindow::calibrateGyro);
     return page;
 }
 
@@ -162,9 +741,9 @@ QWidget *MainWindow::buildCliTab()
     connect(enter, &QPushButton::clicked, this, &MainWindow::enterCli);
     connect(send, &QPushButton::clicked, this, &MainWindow::sendCliCommand);
     connect(m_cliInput, &QLineEdit::returnPressed, this, &MainWindow::sendCliCommand);
-    connect(dump, &QPushButton::clicked, this, [this]() { m_cli.sendCommand(QStringLiteral("dump")); });
-    connect(status, &QPushButton::clicked, this, [this]() { m_cli.sendCommand(QStringLiteral("status")); });
-    connect(stats, &QPushButton::clicked, this, [this]() { m_cli.sendCommand(QStringLiteral("stats")); });
+    connect(dump, &QPushButton::clicked, this, [this]() { sendCliWhenReady({QStringLiteral("dump")}); });
+    connect(status, &QPushButton::clicked, this, [this]() { sendCliWhenReady({QStringLiteral("status")}); });
+    connect(stats, &QPushButton::clicked, this, [this]() { sendCliWhenReady({QStringLiteral("stats")}); });
 
     return page;
 }
@@ -209,9 +788,11 @@ void MainWindow::connectSerial()
         QMessageBox::warning(this, QStringLiteral("No port"), QStringLiteral("Select a serial port first."));
         return;
     }
+    setTransport(&m_serial);
     if (m_serial.open(port)) {
-        setTransport(&m_serial);
         setConnectedUi(true);
+    } else {
+        setTransport(nullptr);
     }
 }
 
@@ -232,6 +813,7 @@ void MainWindow::disconnectTransport()
     if (m_transport) {
         m_transport->close();
     }
+    stopSensorPolling();
     setConnectedUi(false);
 }
 
@@ -247,7 +829,7 @@ void MainWindow::sendCliCommand()
         return;
     }
     m_cliOutput->appendPlainText(QStringLiteral("> %1").arg(command));
-    m_cli.sendCommand(command);
+    sendCliWhenReady({command});
     m_cliInput->clear();
 }
 
@@ -256,17 +838,361 @@ void MainWindow::requestStatus()
     sendMsp(MspCodec::Status);
 }
 
+void MainWindow::requestHandshake()
+{
+    sendMsp(MspCodec::ApiVersion);
+    sendMsp(MspCodec::FcVariant);
+    sendMsp(MspCodec::FcVersion);
+    sendMsp(MspCodec::BoardInfo);
+    sendMsp(MspCodec::BuildInfo);
+    sendMsp(MspCodec::Status);
+    sendMsp(MspCodec::RxConfigCommand);
+}
+
+void MainWindow::requestRxConfig()
+{
+    sendMsp(MspCodec::RxConfigCommand);
+}
+
+void MainWindow::applyRxProvider()
+{
+    const quint8 provider = static_cast<quint8>(m_rxProvider->currentData().toUInt());
+    sendMsp(MspCodec::SetRxConfigCommand, MspCodec::encodeSetRxProvider(m_rxConfig, provider));
+    sendMsp(MspCodec::RxConfigCommand);
+}
+
+void MainWindow::saveToFc()
+{
+    sendMsp(MspCodec::EepromWrite);
+    sendCliWhenReady({QStringLiteral("save")});
+}
+
+void MainWindow::writeSaveReboot()
+{
+    const QStringList configCommands = m_config.toCliSetCommands();
+    const auto answer = QMessageBox::question(
+        this,
+        QStringLiteral("Write and Reboot FC"),
+        QStringLiteral("Write %1 pending config changes, save, and reboot the flight controller now? Motors must be disarmed.")
+            .arg(configCommands.size()));
+    if (answer != QMessageBox::Yes) {
+        return;
+    }
+
+    QStringList commands = configCommands;
+    commands << QStringLiteral("save") << QStringLiteral("reboot");
+    sendCliWhenReady(commands);
+    sendMsp(MspCodec::EepromWrite);
+    sendMsp(MspCodec::Reboot);
+
+    if (!configCommands.isEmpty()) {
+        m_config.clearDirty();
+        updateConfigUi();
+    }
+    appendLog(configCommands.isEmpty()
+        ? QStringLiteral("Queued save and reboot.")
+        : QStringLiteral("Queued %1 config changes, save, and reboot.").arg(configCommands.size()));
+}
+
+void MainWindow::loadConfigDump()
+{
+    m_captureDump = true;
+    m_cliCapture.clear();
+    sendCliWhenReady({QStringLiteral("dump")});
+    appendLog(QStringLiteral("Requested CLI dump"));
+}
+
+void MainWindow::applyConfigChanges()
+{
+    const QStringList commands = m_config.toCliSetCommands();
+    if (commands.isEmpty()) {
+        appendLog(QStringLiteral("No config changes to apply"));
+        return;
+    }
+    sendCliWhenReady(commands);
+    appendLog(QStringLiteral("Queued %1 pending CLI settings. Use Write to FC && Reboot to persist and restart.").arg(commands.size()));
+    m_config.clearDirty();
+    updateConfigUi();
+}
+
+void MainWindow::rebootFc()
+{
+    const auto answer = QMessageBox::question(
+        this,
+        QStringLiteral("Reboot FC"),
+        QStringLiteral("Reboot the flight controller now? Motors must be disarmed."));
+    if (answer != QMessageBox::Yes) {
+        return;
+    }
+    sendCliWhenReady({QStringLiteral("reboot")});
+    sendMsp(MspCodec::Reboot);
+}
+
+void MainWindow::applyMotorsFromUi()
+{
+    m_config.setValue(QStringLiteral("output_motor_protocol"), m_motorProtocol->currentText());
+    m_config.setInt(QStringLiteral("output_motor_rate"), m_motorRate->value());
+    m_config.setInt(QStringLiteral("output_min_command"), m_minCommand->value());
+    m_config.setInt(QStringLiteral("output_min_throttle"), m_minThrottle->value());
+    m_config.setInt(QStringLiteral("output_max_throttle"), m_maxThrottle->value());
+    m_config.setInt(QStringLiteral("mixer_output_limit"), m_outputLimit->value());
+    m_config.setValue(QStringLiteral("mixer_throttle_limit_type"), m_throttleLimitType->currentText());
+    m_config.setInt(QStringLiteral("mixer_throttle_limit_percent"), m_throttleLimitPercent->value());
+    for (int i = 0; i < 4; ++i) {
+        m_config.setInt(QStringLiteral("pin_output_%1").arg(i), m_motorPins[i]->value());
+    }
+    appendLog(QStringLiteral("Motor fields staged. Use Write to FC && Reboot to write them to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyMotorPreset()
+{
+    m_config.setValue(QStringLiteral("mixer_type"), QStringLiteral("QUADX"));
+    m_config.setInt(QStringLiteral("mix_outputs"), 4);
+    m_config.setValue(QStringLiteral("output_motor_protocol"), QStringLiteral("PWM"));
+    m_config.setInt(QStringLiteral("output_motor_rate"), 50);
+    m_config.setInt(QStringLiteral("output_min_command"), 1000);
+    m_config.setInt(QStringLiteral("output_min_throttle"), 1070);
+    m_config.setInt(QStringLiteral("output_max_throttle"), 2000);
+    m_config.setInt(QStringLiteral("mixer_output_limit"), 100);
+    m_config.setValue(QStringLiteral("mixer_throttle_limit_type"), QStringLiteral("NONE"));
+    m_config.setInt(QStringLiteral("mixer_throttle_limit_percent"), 100);
+    m_config.setInt(QStringLiteral("pin_output_0"), 39);
+    m_config.setInt(QStringLiteral("pin_output_1"), 40);
+    m_config.setInt(QStringLiteral("pin_output_2"), 41);
+    m_config.setInt(QStringLiteral("pin_output_3"), 42);
+    for (int i = 0; i < 4; ++i) {
+        m_config.set(QStringLiteral("output_%1").arg(i), {QStringLiteral("M"), QStringLiteral("N"), QStringLiteral("1000"), QStringLiteral("1500"), QStringLiteral("2000")});
+    }
+    appendLog(QStringLiteral("PWM QuadX motor preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::stagePidFields()
+{
+    const QStringList axes = {QStringLiteral("roll"), QStringLiteral("pitch"), QStringLiteral("yaw"), QStringLiteral("level")};
+    const QStringList terms = {QStringLiteral("p"), QStringLiteral("i"), QStringLiteral("d"), QStringLiteral("f")};
+    for (int row = 0; row < axes.size(); ++row) {
+        for (int col = 0; col < terms.size(); ++col) {
+            m_config.setInt(QStringLiteral("pid_%1_%2").arg(axes.at(row), terms.at(col)), m_pid[row][col]->value());
+        }
+    }
+    m_config.setValue(QStringLiteral("pid_dterm_lpf_type"), m_dtermLpfType->currentText());
+    m_config.setInt(QStringLiteral("pid_dterm_lpf_freq"), m_dtermLpfFreq->value());
+    m_config.setValue(QStringLiteral("pid_dterm_lpf2_type"), m_dtermLpf2Type->currentText());
+    m_config.setInt(QStringLiteral("pid_dterm_lpf2_freq"), m_dtermLpf2Freq->value());
+    m_config.setInt(QStringLiteral("pid_dterm_notch_freq"), m_dtermNotchFreq->value());
+    m_config.setInt(QStringLiteral("pid_dterm_notch_cutoff"), m_dtermNotchCutoff->value());
+    m_config.setInt(QStringLiteral("pid_dterm_dyn_lpf_min"), m_dtermDynMin->value());
+    m_config.setInt(QStringLiteral("pid_dterm_dyn_lpf_max"), m_dtermDynMax->value());
+    m_config.setInt(QStringLiteral("pid_iterm_limit"), m_itermLimit->value());
+    m_config.setValue(QStringLiteral("pid_iterm_zero"), m_itermZero->currentText());
+    m_config.setValue(QStringLiteral("pid_iterm_relax"), m_itermRelax->currentText());
+    m_config.setInt(QStringLiteral("pid_iterm_relax_cutoff"), m_itermRelaxCutoff->value());
+    m_config.setInt(QStringLiteral("pid_tpa_scale"), m_tpaScale->value());
+    m_config.setInt(QStringLiteral("pid_tpa_breakpoint"), m_tpaBreakpoint->value());
+    appendLog(QStringLiteral("PID fields staged. Use Write to FC && Reboot to write them to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyPidBeginnerPreset()
+{
+    m_config.setInt(QStringLiteral("input_roll_expo"), 30);
+    m_config.setInt(QStringLiteral("input_pitch_expo"), 30);
+    m_config.setInt(QStringLiteral("input_yaw_expo"), 20);
+    m_config.setInt(QStringLiteral("input_roll_limit"), 250);
+    m_config.setInt(QStringLiteral("input_pitch_limit"), 250);
+    appendLog(QStringLiteral("Beginner Soft staged rate/expo/limit changes; PID gains were left unchanged."));
+    updateConfigUi();
+}
+
+void MainWindow::stageFilterFields()
+{
+    m_config.setValue(QStringLiteral("gyro_lpf_type"), m_filterGyroLpfType->currentText());
+    m_config.setInt(QStringLiteral("gyro_lpf_freq"), m_filterGyroLpfFreq->value());
+    m_config.setValue(QStringLiteral("gyro_lpf2_type"), m_filterGyroLpf2Type->currentText());
+    m_config.setInt(QStringLiteral("gyro_lpf2_freq"), m_filterGyroLpf2Freq->value());
+    m_config.setValue(QStringLiteral("gyro_lpf3_type"), m_filterGyroLpf3Type->currentText());
+    m_config.setInt(QStringLiteral("gyro_lpf3_freq"), m_filterGyroLpf3Freq->value());
+    m_config.setInt(QStringLiteral("gyro_notch1_freq"), m_filterGyroNotch1Freq->value());
+    m_config.setInt(QStringLiteral("gyro_notch1_cutoff"), m_filterGyroNotch1Cutoff->value());
+    m_config.setInt(QStringLiteral("gyro_notch2_freq"), m_filterGyroNotch2Freq->value());
+    m_config.setInt(QStringLiteral("gyro_notch2_cutoff"), m_filterGyroNotch2Cutoff->value());
+    m_config.setBool(QStringLiteral("feature_dyn_notch"), m_filterDynNotch->isChecked());
+    m_config.setInt(QStringLiteral("gyro_dyn_lpf_min"), m_filterGyroDynLpfMin->value());
+    m_config.setInt(QStringLiteral("gyro_dyn_lpf_max"), m_filterGyroDynLpfMax->value());
+    m_config.setInt(QStringLiteral("gyro_dyn_notch_q"), m_filterGyroDynNotchQ->value());
+    m_config.setInt(QStringLiteral("gyro_dyn_notch_count"), m_filterGyroDynNotchCount->value());
+    m_config.setInt(QStringLiteral("gyro_dyn_notch_min"), m_filterGyroDynNotchMin->value());
+    m_config.setInt(QStringLiteral("gyro_dyn_notch_max"), m_filterGyroDynNotchMax->value());
+    m_config.setValue(QStringLiteral("pid_dterm_lpf_type"), m_filterDtermLpfType->currentText());
+    m_config.setInt(QStringLiteral("pid_dterm_lpf_freq"), m_filterDtermLpfFreq->value());
+    m_config.setValue(QStringLiteral("pid_dterm_lpf2_type"), m_filterDtermLpf2Type->currentText());
+    m_config.setInt(QStringLiteral("pid_dterm_lpf2_freq"), m_filterDtermLpf2Freq->value());
+    m_config.setInt(QStringLiteral("pid_dterm_notch_freq"), m_filterDtermNotchFreq->value());
+    m_config.setInt(QStringLiteral("pid_dterm_notch_cutoff"), m_filterDtermNotchCutoff->value());
+    m_config.setInt(QStringLiteral("pid_dterm_dyn_lpf_min"), m_filterDtermDynLpfMin->value());
+    m_config.setInt(QStringLiteral("pid_dterm_dyn_lpf_max"), m_filterDtermDynLpfMax->value());
+    appendLog(QStringLiteral("Filter fields staged. Use Write to FC && Reboot to write them to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyFilterDefaultPreset()
+{
+    m_config.setValue(QStringLiteral("gyro_lpf_type"), QStringLiteral("PT1"));
+    m_config.setInt(QStringLiteral("gyro_lpf_freq"), 100);
+    m_config.setValue(QStringLiteral("gyro_lpf2_type"), QStringLiteral("PT1"));
+    m_config.setInt(QStringLiteral("gyro_lpf2_freq"), 213);
+    m_config.setValue(QStringLiteral("gyro_lpf3_type"), QStringLiteral("FO"));
+    m_config.setInt(QStringLiteral("gyro_lpf3_freq"), 150);
+    m_config.setInt(QStringLiteral("gyro_notch1_freq"), 0);
+    m_config.setInt(QStringLiteral("gyro_notch1_cutoff"), 0);
+    m_config.setInt(QStringLiteral("gyro_notch2_freq"), 0);
+    m_config.setInt(QStringLiteral("gyro_notch2_cutoff"), 0);
+    m_config.setInt(QStringLiteral("gyro_dyn_lpf_min"), 170);
+    m_config.setInt(QStringLiteral("gyro_dyn_lpf_max"), 425);
+    m_config.setInt(QStringLiteral("gyro_dyn_notch_q"), 300);
+    m_config.setInt(QStringLiteral("gyro_dyn_notch_count"), 4);
+    m_config.setInt(QStringLiteral("gyro_dyn_notch_min"), 80);
+    m_config.setInt(QStringLiteral("gyro_dyn_notch_max"), 400);
+    m_config.setValue(QStringLiteral("pid_dterm_lpf_type"), QStringLiteral("PT1"));
+    m_config.setInt(QStringLiteral("pid_dterm_lpf_freq"), 100);
+    m_config.setValue(QStringLiteral("pid_dterm_lpf2_type"), QStringLiteral("PT1"));
+    m_config.setInt(QStringLiteral("pid_dterm_lpf2_freq"), 100);
+    m_config.setInt(QStringLiteral("pid_dterm_notch_freq"), 0);
+    m_config.setInt(QStringLiteral("pid_dterm_notch_cutoff"), 0);
+    appendLog(QStringLiteral("Default filter preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyFilterMorePreset()
+{
+    applyFilterDefaultPreset();
+    m_config.setInt(QStringLiteral("gyro_lpf_freq"), 80);
+    m_config.setInt(QStringLiteral("gyro_lpf2_freq"), 150);
+    m_config.setInt(QStringLiteral("gyro_lpf3_freq"), 120);
+    m_config.setInt(QStringLiteral("pid_dterm_lpf_freq"), 90);
+    m_config.setInt(QStringLiteral("pid_dterm_lpf2_freq"), 90);
+    appendLog(QStringLiteral("More Filtering preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyFilterStrongPreset()
+{
+    applyFilterDefaultPreset();
+    m_config.setInt(QStringLiteral("gyro_lpf_freq"), 60);
+    m_config.setInt(QStringLiteral("gyro_lpf2_freq"), 100);
+    m_config.setInt(QStringLiteral("gyro_lpf3_freq"), 90);
+    m_config.setInt(QStringLiteral("pid_dterm_lpf_freq"), 70);
+    m_config.setInt(QStringLiteral("pid_dterm_lpf2_freq"), 70);
+    appendLog(QStringLiteral("Strong Filtering preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyFilterLowLatencyPreset()
+{
+    applyFilterDefaultPreset();
+    m_config.setInt(QStringLiteral("gyro_lpf_freq"), 120);
+    m_config.setInt(QStringLiteral("gyro_lpf2_freq"), 250);
+    m_config.setInt(QStringLiteral("gyro_lpf3_freq"), 180);
+    m_config.setInt(QStringLiteral("pid_dterm_lpf_freq"), 120);
+    m_config.setInt(QStringLiteral("pid_dterm_lpf2_freq"), 120);
+    appendLog(QStringLiteral("Low Latency filter preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::startSensorPolling()
+{
+    if (!m_transport || !m_transport->isOpen()) {
+        appendLog(QStringLiteral("Connect before starting live sensors."));
+        return;
+    }
+    m_sensorPollTimer.start();
+    if (m_sensorLiveLabel) {
+        m_sensorLiveLabel->setText(QStringLiteral("Polling MSP_ATTITUDE/MSP_RAW_IMU at 10 Hz"));
+    }
+    requestSensorFrame();
+}
+
+void MainWindow::stopSensorPolling()
+{
+    m_sensorPollTimer.stop();
+    if (m_sensorLiveLabel) {
+        m_sensorLiveLabel->setText(QStringLiteral("Stopped"));
+    }
+}
+
+void MainWindow::requestSensorFrame()
+{
+    sendMsp(MspCodec::Attitude);
+    sendMsp(MspCodec::RawImu);
+}
+
+void MainWindow::stageGyroAlign()
+{
+    if (!m_gyroAlign) {
+        return;
+    }
+    m_config.setValue(QStringLiteral("gyro_align"), m_gyroAlign->currentText());
+    appendLog(QStringLiteral("gyro_align staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::refreshGyroAlign()
+{
+    m_pendingParamName = QStringLiteral("gyro_align");
+    m_pendingParamCapture.clear();
+    sendCliWhenReady({QStringLiteral("get gyro_align")});
+    appendLog(QStringLiteral("Requested gyro_align from CLI"));
+}
+
+void MainWindow::calibrateGyro()
+{
+    const auto answer = QMessageBox::question(
+        this,
+        QStringLiteral("Calibrate Gyro"),
+        QStringLiteral("Keep the flight controller still and level. Run gyro calibration now?"));
+    if (answer != QMessageBox::Yes) {
+        return;
+    }
+    sendCliWhenReady({QStringLiteral("cal gyro")});
+}
+
 void MainWindow::handleMspMessage(const MspMessage &message)
 {
     appendLog(QStringLiteral("Received %1 (%2 bytes)").arg(MspCodec::commandName(message.command)).arg(message.payload.size()));
-    if (message.command == MspCodec::Status || message.command == MspCodec::StatusEx) {
+    if (message.command == MspCodec::ApiVersion) {
+        m_firmware = MspCodec::parseApiVersion(message, m_firmware);
+        updateFirmwareLabel();
+    } else if (message.command == MspCodec::FcVariant) {
+        m_firmware = MspCodec::parseFcVariant(message, m_firmware);
+        updateFirmwareLabel();
+    } else if (message.command == MspCodec::FcVersion) {
+        m_firmware = MspCodec::parseFcVersion(message, m_firmware);
+        updateFirmwareLabel();
+    } else if (message.command == MspCodec::BoardInfo) {
+        m_firmware = MspCodec::parseBoardInfo(message, m_firmware);
+        updateFirmwareLabel();
+    } else if (message.command == MspCodec::BuildInfo) {
+        m_firmware = MspCodec::parseBuildInfo(message, m_firmware);
+        updateFirmwareLabel();
+    } else if (message.command == MspCodec::RxConfigCommand) {
+        m_rxConfig = MspCodec::parseRxConfig(message);
+        updateRxUi();
+    } else if (message.command == MspCodec::Attitude) {
+        m_attitude = MspCodec::parseAttitude(message);
+        updateSensorUi();
+    } else if (message.command == MspCodec::RawImu) {
+        m_rawImu = MspCodec::parseRawImu(message);
+        updateSensorUi();
+    } else if (message.command == MspCodec::Status || message.command == MspCodec::StatusEx) {
         FcStatus status = MspCodec::parseStatus(message);
         m_state.setStatus(status);
         m_sensorLabel->setText(QStringLiteral("gyro=%1 accel=%2 baro=%3 mag=%4 gps=%5")
             .arg(status.gyroPresent).arg(status.accelPresent).arg(status.baroPresent).arg(status.magPresent).arg(status.gpsPresent));
         m_statusLabel->setText(QStringLiteral("loop=%1 us, cpu=%2, i2c errors=%3")
             .arg(status.loopTimeUs).arg(status.cpuLoad).arg(status.i2cErrors));
-        m_armingLabel->setText(QStringLiteral("0x%1").arg(status.armingDisableFlags, 8, 16, QLatin1Char('0')));
+        m_armingLabel->setText(armingFlagsText(status.armingDisableFlags));
     }
 }
 
@@ -284,6 +1210,9 @@ void MainWindow::setConnectedUi(bool connected)
     m_tcpConnect->setEnabled(!connected);
     m_disconnect->setEnabled(connected);
     m_connectionLabel->setText(connected && m_transport ? QStringLiteral("Connected: %1").arg(m_transport->name()) : QStringLiteral("Disconnected"));
+    if (!connected) {
+        stopSensorPolling();
+    }
 }
 
 void MainWindow::setTransport(ITransport *transport)
@@ -293,21 +1222,379 @@ void MainWindow::setTransport(ITransport *transport)
     }
     m_transport = transport;
     m_cli.setTransport(transport);
+    m_msp.setTransport(transport);
 
     if (!m_transport) {
         return;
     }
-    connect(m_transport, &ITransport::bytesReceived, &m_msp, &MspCodec::consume);
     connect(m_transport, &ITransport::opened, this, [this]() { setConnectedUi(true); });
+    connect(m_transport, &ITransport::opened, this, &MainWindow::requestHandshake);
     connect(m_transport, &ITransport::closed, this, [this]() { setConnectedUi(false); });
     connect(m_transport, &ITransport::errorOccurred, this, &MainWindow::appendLog);
 }
 
 void MainWindow::sendMsp(quint16 command, const QByteArray &payload)
 {
-    if (!m_transport || !m_transport->isOpen()) {
-        appendLog(QStringLiteral("No active transport"));
+    m_msp.request(command, payload);
+}
+
+void MainWindow::sendCliWhenReady(const QStringList &commands)
+{
+    if (commands.isEmpty()) {
         return;
     }
-    m_transport->writeBytes(MspCodec::encodeV1(command, payload));
+    m_pendingCliCommands += commands;
+    if (m_cli.isActive()) {
+        flushPendingCliCommands();
+        return;
+    }
+    m_cli.enter();
+}
+
+void MainWindow::flushPendingCliCommands()
+{
+    if (!m_cli.isActive() || m_pendingCliCommands.isEmpty()) {
+        return;
+    }
+    const QStringList commands = m_pendingCliCommands;
+    m_pendingCliCommands.clear();
+    for (const QString &command : commands) {
+        m_cli.sendCommand(command);
+    }
+}
+
+void MainWindow::updateFirmwareLabel()
+{
+    m_firmwareLabel->setText(m_firmware.summary());
+}
+
+void MainWindow::updateRxUi()
+{
+    const int index = m_rxProvider->findData(m_rxConfig.serialRxProvider);
+    if (index >= 0) {
+        m_rxProvider->setCurrentIndex(index);
+    }
+    m_rxSummary->setText(QStringLiteral("%1, min/mid/max RC %2/%3/%4, min/max check %5/%6")
+        .arg(RxConfig::providerName(m_rxConfig.serialRxProvider))
+        .arg(m_rxConfig.minRc)
+        .arg(m_rxConfig.midRc)
+        .arg(m_rxConfig.maxRc)
+        .arg(m_rxConfig.minCheck)
+        .arg(m_rxConfig.maxCheck));
+}
+
+void MainWindow::updateConfigUi()
+{
+    const int dirtyCount = m_config.dirtyParams().size();
+    if (m_configSummary) {
+        m_configSummary->setText(QStringLiteral("%1 params loaded, %2 pending changes")
+            .arg(m_config.size())
+            .arg(dirtyCount));
+    }
+    if (m_applyConfig) {
+        m_applyConfig->setEnabled(true);
+    }
+    updateMotorsUi();
+    updateMotorValidation();
+    updatePidUi();
+    updatePidValidation();
+    updateFiltersUi();
+    updateFilterValidation();
+    updateSensorUi();
+    syncGyroAlignUiFromConfig();
+    if (!m_setupValidation) {
+        return;
+    }
+
+    QStringList checks;
+    auto mark = [](bool ok, const QString &label) {
+        return QStringLiteral("%1 %2").arg(ok ? QStringLiteral("OK:") : QStringLiteral("WARN:"), label);
+    };
+
+    checks << mark(m_state.status().gyroPresent, QStringLiteral("IMU gyro detected"));
+    checks << mark(m_state.status().accelPresent, QStringLiteral("accelerometer detected"));
+    checks << mark((m_state.status().armingDisableFlags & (1u << 2)) == 0, QStringLiteral("RX_FAILSAFE clear"));
+    checks << mark((m_state.status().armingDisableFlags & (1u << 7)) == 0, QStringLiteral("throttle low enough to arm"));
+    checks << mark(m_config.value(QStringLiteral("output_motor_protocol")) != QStringLiteral("DISABLED"), QStringLiteral("motor protocol configured"));
+    checks << mark(m_config.intValue(QStringLiteral("mix_outputs"), 0) > 0 || m_config.value(QStringLiteral("mixer_type")) == QStringLiteral("QUADX"), QStringLiteral("mixer outputs configured"));
+    checks << mark(m_config.values(QStringLiteral("mode_0")).value(2) != QStringLiteral("900") || m_config.values(QStringLiteral("mode_0")).value(3) != QStringLiteral("900"), QStringLiteral("arm mode configured"));
+
+    const QStringList serial1 = m_config.values(QStringLiteral("serial_1"));
+    const QStringList serial2 = m_config.values(QStringLiteral("serial_2"));
+    const bool duplicateRx = serial1.value(0) == QStringLiteral("64") && serial2.value(0) == QStringLiteral("64");
+    checks << mark(!duplicateRx, QStringLiteral("only one serial port uses RX_SERIAL"));
+    m_setupValidation->setText(checks.join(QStringLiteral("\n")));
+}
+
+void MainWindow::updateMotorsUi()
+{
+    if (!m_motorProtocol) {
+        return;
+    }
+    auto setCombo = [](QComboBox *combo, const QString &value) {
+        const int index = combo->findText(value);
+        if (index >= 0) {
+            combo->setCurrentIndex(index);
+        }
+    };
+    setCombo(m_motorProtocol, m_config.value(QStringLiteral("output_motor_protocol"), QStringLiteral("PWM")));
+    setCombo(m_throttleLimitType, m_config.value(QStringLiteral("mixer_throttle_limit_type"), QStringLiteral("NONE")));
+    m_motorRate->setValue(m_config.intValue(QStringLiteral("output_motor_rate"), 50));
+    m_minCommand->setValue(m_config.intValue(QStringLiteral("output_min_command"), 1000));
+    m_minThrottle->setValue(m_config.intValue(QStringLiteral("output_min_throttle"), 1070));
+    m_maxThrottle->setValue(m_config.intValue(QStringLiteral("output_max_throttle"), 2000));
+    m_outputLimit->setValue(m_config.intValue(QStringLiteral("mixer_output_limit"), 100));
+    m_throttleLimitPercent->setValue(m_config.intValue(QStringLiteral("mixer_throttle_limit_percent"), 100));
+    const int defaultPins[4] = {39, 40, 41, 42};
+    for (int i = 0; i < 4; ++i) {
+        m_motorPins[i]->setValue(m_config.intValue(QStringLiteral("pin_output_%1").arg(i), defaultPins[i]));
+    }
+}
+
+void MainWindow::updateMotorValidation()
+{
+    if (!m_motorValidation) {
+        return;
+    }
+    QStringList checks;
+    auto mark = [](bool ok, const QString &label) {
+        return QStringLiteral("%1 %2").arg(ok ? QStringLiteral("OK:") : QStringLiteral("WARN:"), label);
+    };
+    const QString protocol = m_config.value(QStringLiteral("output_motor_protocol"));
+    checks << mark(!protocol.isEmpty() && protocol != QStringLiteral("DISABLED"), QStringLiteral("motor protocol is enabled"));
+    checks << mark(m_config.intValue(QStringLiteral("mix_outputs"), 0) > 0 || m_config.value(QStringLiteral("mixer_type")) == QStringLiteral("QUADX"), QStringLiteral("mixer has active outputs"));
+    checks << mark(m_config.intValue(QStringLiteral("output_min_command"), 0) < m_config.intValue(QStringLiteral("output_min_throttle"), 0), QStringLiteral("min command is below min throttle"));
+    checks << mark(m_config.intValue(QStringLiteral("output_min_throttle"), 0) < m_config.intValue(QStringLiteral("output_max_throttle"), 0), QStringLiteral("min throttle is below max throttle"));
+    checks << mark(m_config.intValue(QStringLiteral("output_motor_rate"), 0) <= 500 || !protocol.startsWith(QStringLiteral("PWM")), QStringLiteral("PWM rate is standard/compatible"));
+    checks << mark(m_config.intValue(QStringLiteral("pin_output_0"), -1) != -1 && m_config.intValue(QStringLiteral("pin_output_1"), -1) != -1 && m_config.intValue(QStringLiteral("pin_output_2"), -1) != -1 && m_config.intValue(QStringLiteral("pin_output_3"), -1) != -1, QStringLiteral("all four motor pins assigned"));
+    checks << QStringLiteral("INFO: Props-off confirmation will be required before future live motor tests.");
+    m_motorValidation->setText(checks.join(QStringLiteral("\n")));
+}
+
+void MainWindow::updatePidUi()
+{
+    if (!m_pid[0][0]) {
+        return;
+    }
+    auto setCombo = [](QComboBox *combo, const QString &value) {
+        const int index = combo->findText(value);
+        if (index >= 0) {
+            combo->setCurrentIndex(index);
+        }
+    };
+    const QStringList axes = {QStringLiteral("roll"), QStringLiteral("pitch"), QStringLiteral("yaw"), QStringLiteral("level")};
+    const QStringList terms = {QStringLiteral("p"), QStringLiteral("i"), QStringLiteral("d"), QStringLiteral("f")};
+    const int defaults[4][4] = {
+        {42, 85, 30, 90},
+        {46, 90, 32, 95},
+        {45, 90, 0, 90},
+        {55, 0, 0, 0},
+    };
+    for (int row = 0; row < axes.size(); ++row) {
+        for (int col = 0; col < terms.size(); ++col) {
+            m_pid[row][col]->setValue(m_config.intValue(QStringLiteral("pid_%1_%2").arg(axes.at(row), terms.at(col)), defaults[row][col]));
+        }
+    }
+    setCombo(m_dtermLpfType, m_config.value(QStringLiteral("pid_dterm_lpf_type"), QStringLiteral("PT1")));
+    m_dtermLpfFreq->setValue(m_config.intValue(QStringLiteral("pid_dterm_lpf_freq"), 100));
+    setCombo(m_dtermLpf2Type, m_config.value(QStringLiteral("pid_dterm_lpf2_type"), QStringLiteral("PT1")));
+    m_dtermLpf2Freq->setValue(m_config.intValue(QStringLiteral("pid_dterm_lpf2_freq"), 100));
+    m_dtermNotchFreq->setValue(m_config.intValue(QStringLiteral("pid_dterm_notch_freq"), 0));
+    m_dtermNotchCutoff->setValue(m_config.intValue(QStringLiteral("pid_dterm_notch_cutoff"), 0));
+    m_dtermDynMin->setValue(m_config.intValue(QStringLiteral("pid_dterm_dyn_lpf_min"), 0));
+    m_dtermDynMax->setValue(m_config.intValue(QStringLiteral("pid_dterm_dyn_lpf_max"), 0));
+    m_itermLimit->setValue(m_config.intValue(QStringLiteral("pid_iterm_limit"), 30));
+    setCombo(m_itermZero, m_config.value(QStringLiteral("pid_iterm_zero"), QStringLiteral("1")));
+    setCombo(m_itermRelax, m_config.value(QStringLiteral("pid_iterm_relax"), QStringLiteral("RP")));
+    m_itermRelaxCutoff->setValue(m_config.intValue(QStringLiteral("pid_iterm_relax_cutoff"), 15));
+    m_tpaScale->setValue(m_config.intValue(QStringLiteral("pid_tpa_scale"), 10));
+    m_tpaBreakpoint->setValue(m_config.intValue(QStringLiteral("pid_tpa_breakpoint"), 1650));
+}
+
+void MainWindow::updatePidValidation()
+{
+    if (!m_pidValidation) {
+        return;
+    }
+    QStringList checks;
+    auto mark = [](bool ok, const QString &label) {
+        return QStringLiteral("%1 %2").arg(ok ? QStringLiteral("OK:") : QStringLiteral("WARN:"), label);
+    };
+    const int rollD = m_config.intValue(QStringLiteral("pid_roll_d"), m_pid[0][2] ? m_pid[0][2]->value() : 0);
+    const int pitchD = m_config.intValue(QStringLiteral("pid_pitch_d"), m_pid[1][2] ? m_pid[1][2]->value() : 0);
+    const int yawD = m_config.intValue(QStringLiteral("pid_yaw_d"), m_pid[2][2] ? m_pid[2][2]->value() : 0);
+    const int dtermFreq = m_config.intValue(QStringLiteral("pid_dterm_lpf_freq"), m_dtermLpfFreq ? m_dtermLpfFreq->value() : 0);
+    const bool anyMainPid = m_config.intValue(QStringLiteral("pid_roll_p"), m_pid[0][0] ? m_pid[0][0]->value() : 0) > 0
+        || m_config.intValue(QStringLiteral("pid_pitch_p"), m_pid[1][0] ? m_pid[1][0]->value() : 0) > 0
+        || m_config.intValue(QStringLiteral("pid_yaw_p"), m_pid[2][0] ? m_pid[2][0]->value() : 0) > 0;
+    checks << mark(anyMainPid, QStringLiteral("main axis P gains are non-zero"));
+    checks << mark(rollD <= 80 && pitchD <= 80, QStringLiteral("roll/pitch D values are in a conservative range"));
+    checks << mark(yawD <= 30, QStringLiteral("yaw D is low or zero"));
+    checks << mark(dtermFreq == 0 || dtermFreq >= 50, QStringLiteral("D-term LPF cutoff is not extremely low"));
+    checks << QStringLiteral("INFO: Beginner Soft changes rates/expo/limits, not PID gains.");
+    m_pidValidation->setText(checks.join(QStringLiteral("\n")));
+}
+
+void MainWindow::updateFiltersUi()
+{
+    if (!m_filterGyroLpfType) {
+        return;
+    }
+    auto setCombo = [](QComboBox *combo, const QString &value) {
+        const int index = combo->findText(value);
+        if (index >= 0) {
+            combo->setCurrentIndex(index);
+        }
+    };
+
+    setCombo(m_filterGyroLpfType, m_config.value(QStringLiteral("gyro_lpf_type"), QStringLiteral("PT1")));
+    m_filterGyroLpfFreq->setValue(m_config.intValue(QStringLiteral("gyro_lpf_freq"), 100));
+    setCombo(m_filterGyroLpf2Type, m_config.value(QStringLiteral("gyro_lpf2_type"), QStringLiteral("PT1")));
+    m_filterGyroLpf2Freq->setValue(m_config.intValue(QStringLiteral("gyro_lpf2_freq"), 213));
+    setCombo(m_filterGyroLpf3Type, m_config.value(QStringLiteral("gyro_lpf3_type"), QStringLiteral("FO")));
+    m_filterGyroLpf3Freq->setValue(m_config.intValue(QStringLiteral("gyro_lpf3_freq"), 150));
+    m_filterGyroNotch1Freq->setValue(m_config.intValue(QStringLiteral("gyro_notch1_freq"), 0));
+    m_filterGyroNotch1Cutoff->setValue(m_config.intValue(QStringLiteral("gyro_notch1_cutoff"), 0));
+    m_filterGyroNotch2Freq->setValue(m_config.intValue(QStringLiteral("gyro_notch2_freq"), 0));
+    m_filterGyroNotch2Cutoff->setValue(m_config.intValue(QStringLiteral("gyro_notch2_cutoff"), 0));
+    m_filterDynNotch->setChecked(m_config.boolValue(QStringLiteral("feature_dyn_notch"), false));
+    m_filterGyroDynLpfMin->setValue(m_config.intValue(QStringLiteral("gyro_dyn_lpf_min"), 170));
+    m_filterGyroDynLpfMax->setValue(m_config.intValue(QStringLiteral("gyro_dyn_lpf_max"), 425));
+    m_filterGyroDynNotchQ->setValue(m_config.intValue(QStringLiteral("gyro_dyn_notch_q"), 300));
+    m_filterGyroDynNotchCount->setValue(m_config.intValue(QStringLiteral("gyro_dyn_notch_count"), 4));
+    m_filterGyroDynNotchMin->setValue(m_config.intValue(QStringLiteral("gyro_dyn_notch_min"), 80));
+    m_filterGyroDynNotchMax->setValue(m_config.intValue(QStringLiteral("gyro_dyn_notch_max"), 400));
+    setCombo(m_filterDtermLpfType, m_config.value(QStringLiteral("pid_dterm_lpf_type"), QStringLiteral("PT1")));
+    m_filterDtermLpfFreq->setValue(m_config.intValue(QStringLiteral("pid_dterm_lpf_freq"), 100));
+    setCombo(m_filterDtermLpf2Type, m_config.value(QStringLiteral("pid_dterm_lpf2_type"), QStringLiteral("PT1")));
+    m_filterDtermLpf2Freq->setValue(m_config.intValue(QStringLiteral("pid_dterm_lpf2_freq"), 100));
+    m_filterDtermNotchFreq->setValue(m_config.intValue(QStringLiteral("pid_dterm_notch_freq"), 0));
+    m_filterDtermNotchCutoff->setValue(m_config.intValue(QStringLiteral("pid_dterm_notch_cutoff"), 0));
+    m_filterDtermDynLpfMin->setValue(m_config.intValue(QStringLiteral("pid_dterm_dyn_lpf_min"), 0));
+    m_filterDtermDynLpfMax->setValue(m_config.intValue(QStringLiteral("pid_dterm_dyn_lpf_max"), 0));
+}
+
+void MainWindow::updateFilterValidation()
+{
+    if (!m_filterValidation) {
+        return;
+    }
+    QStringList checks;
+    auto mark = [](bool ok, const QString &label) {
+        return QStringLiteral("%1 %2").arg(ok ? QStringLiteral("OK:") : QStringLiteral("WARN:"), label);
+    };
+    auto notchValid = [](int freq, int cutoff) {
+        if (freq == 0 && cutoff == 0) {
+            return true;
+        }
+        return freq > 0 && cutoff > 0 && cutoff < freq;
+    };
+
+    checks << mark(m_config.intValue(QStringLiteral("gyro_lpf_freq"), 100) >= 40, QStringLiteral("gyro LPF cutoff is not extremely low"));
+    const int gyroLpf2 = m_config.intValue(QStringLiteral("gyro_lpf2_freq"), 213);
+    checks << mark(gyroLpf2 == 0 || gyroLpf2 >= 40, QStringLiteral("gyro LPF2 cutoff is disabled or not extremely low"));
+    const int dtermLpf = m_config.intValue(QStringLiteral("pid_dterm_lpf_freq"), 100);
+    checks << mark(dtermLpf == 0 || dtermLpf >= 50, QStringLiteral("D-term LPF cutoff is disabled or not extremely low"));
+    checks << mark(notchValid(m_config.intValue(QStringLiteral("gyro_notch1_freq"), 0), m_config.intValue(QStringLiteral("gyro_notch1_cutoff"), 0)), QStringLiteral("gyro notch 1 cutoff is below frequency"));
+    checks << mark(notchValid(m_config.intValue(QStringLiteral("gyro_notch2_freq"), 0), m_config.intValue(QStringLiteral("gyro_notch2_cutoff"), 0)), QStringLiteral("gyro notch 2 cutoff is below frequency"));
+    checks << mark(notchValid(m_config.intValue(QStringLiteral("pid_dterm_notch_freq"), 0), m_config.intValue(QStringLiteral("pid_dterm_notch_cutoff"), 0)), QStringLiteral("D-term notch cutoff is below frequency"));
+    checks << mark(m_config.intValue(QStringLiteral("gyro_dyn_lpf_min"), 170) <= m_config.intValue(QStringLiteral("gyro_dyn_lpf_max"), 425), QStringLiteral("dynamic gyro LPF min is below max"));
+    if (m_config.boolValue(QStringLiteral("feature_dyn_notch"), false)) {
+        const int count = m_config.intValue(QStringLiteral("gyro_dyn_notch_count"), 4);
+        checks << mark(count >= 1 && count <= 4, QStringLiteral("dynamic notch count is in supported range"));
+        checks << mark(m_config.intValue(QStringLiteral("gyro_dyn_notch_min"), 80) <= m_config.intValue(QStringLiteral("gyro_dyn_notch_max"), 400), QStringLiteral("dynamic notch min is below max"));
+    }
+    checks << QStringLiteral("INFO: lower cutoff means stronger filtering and more delay.");
+    m_filterValidation->setText(checks.join(QStringLiteral("\n")));
+}
+
+void MainWindow::updateSensorUi()
+{
+    if (m_attitudeView) {
+        m_attitudeView->setAttitude(m_attitude);
+    }
+    if (m_attitudeLabel) {
+        m_attitudeLabel->setText(m_attitude.valid
+            ? QStringLiteral("roll %1 deg, pitch %2 deg, yaw %3 deg")
+                .arg(m_attitude.rollDeg, 0, 'f', 1)
+                .arg(m_attitude.pitchDeg, 0, 'f', 1)
+                .arg(m_attitude.yawDeg, 0, 'f', 0)
+            : QStringLiteral("No MSP_ATTITUDE data"));
+    }
+    auto axisText = [](const qint16 values[3]) {
+        return QStringLiteral("X %1, Y %2, Z %3").arg(values[0]).arg(values[1]).arg(values[2]);
+    };
+    if (m_accelLabel) {
+        m_accelLabel->setText(m_rawImu.valid ? axisText(m_rawImu.acc) : QStringLiteral("No MSP_RAW_IMU data"));
+    }
+    if (m_gyroLabel) {
+        m_gyroLabel->setText(m_rawImu.valid ? axisText(m_rawImu.gyro) : QStringLiteral("No MSP_RAW_IMU data"));
+    }
+    if (m_magLabel) {
+        m_magLabel->setText(m_rawImu.valid ? axisText(m_rawImu.mag) : QStringLiteral("No MSP_RAW_IMU data"));
+    }
+}
+
+void MainWindow::syncGyroAlignUiFromConfig()
+{
+    if (m_gyroAlign) {
+        const QString align = m_config.value(QStringLiteral("gyro_align"), QStringLiteral("DEFAULT"));
+        const int index = m_gyroAlign->findText(align);
+        if (index >= 0) {
+            m_gyroAlign->setCurrentIndex(index);
+        }
+    }
+}
+
+void MainWindow::captureCliText(const QString &text)
+{
+    if (!m_pendingParamName.isEmpty()) {
+        m_pendingParamCapture += text;
+        const QRegularExpression matchSet(QStringLiteral("\\bset\\s+(%1)\\s+(?:=\\s*)?([^\\s#>]+)")
+            .arg(QRegularExpression::escape(m_pendingParamName)));
+        const QRegularExpressionMatch match = matchSet.match(m_pendingParamCapture);
+        if (match.hasMatch()) {
+            const QString name = match.captured(1);
+            const QStringList values{match.captured(2).trimmed()};
+            m_config.setClean(name, values);
+            appendLog(QStringLiteral("Refreshed %1: %2").arg(name, values.join(QStringLiteral(" "))));
+            m_pendingParamName.clear();
+            m_pendingParamCapture.clear();
+            updateConfigUi();
+        } else if (m_pendingParamCapture.size() > 256 || m_pendingParamCapture.contains(QStringLiteral("# "))) {
+            appendLog(QStringLiteral("Waiting for %1; captured CLI: %2")
+                .arg(m_pendingParamName, m_pendingParamCapture.simplified().left(220)));
+        }
+    }
+    if (!m_captureDump) {
+        return;
+    }
+    m_cliCapture += text;
+    static const QRegularExpression dumpEnd(QStringLiteral("(^|\\n|\\r)save(\\r?\\n|$)"));
+    if (!dumpEnd.match(m_cliCapture).hasMatch()) {
+        return;
+    }
+    m_captureDump = false;
+    const int count = m_config.loadFromDump(m_cliCapture);
+    appendLog(QStringLiteral("Loaded %1 config params from dump").arg(count));
+    updateConfigUi();
+}
+
+QString MainWindow::armingFlagsText(quint32 flags)
+{
+    if (flags == 0) {
+        return QStringLiteral("READY");
+    }
+    QStringList names;
+    for (qsizetype i = 0; i < static_cast<qsizetype>(ArmingFlagNames.size()); ++i) {
+        if (flags & (1u << i)) {
+            names << QString::fromLatin1(ArmingFlagNames[static_cast<size_t>(i)]);
+        }
+    }
+    const quint32 knownMask = (1u << ArmingFlagNames.size()) - 1u;
+    const quint32 unknown = flags & ~knownMask;
+    if (unknown) {
+        names << QStringLiteral("UNKNOWN(0x%1)").arg(unknown, 8, 16, QLatin1Char('0'));
+    }
+    return names.join(QStringLiteral(", "));
 }

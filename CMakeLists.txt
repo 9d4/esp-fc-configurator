@@ -14,8 +14,15 @@ qt_add_executable(esp-fc-configurator
     src/main.cpp
     src/model/AppState.h
     src/model/FcStatus.h
+    src/model/FcConfigStore.cpp
+    src/model/FcConfigStore.h
+    src/model/FirmwareInfo.h
+    src/model/RxConfig.h
+    src/model/SensorData.h
     src/protocol/CliSession.cpp
     src/protocol/CliSession.h
+    src/protocol/MspClient.cpp
+    src/protocol/MspClient.h
     src/protocol/MspCodec.cpp
     src/protocol/MspCodec.h
     src/transport/ITransport.h
@@ -25,6 +32,8 @@ qt_add_executable(esp-fc-configurator
     src/transport/TcpTransport.h
     src/ui/MainWindow.cpp
     src/ui/MainWindow.h
+    src/ui/AttitudeView.cpp
+    src/ui/AttitudeView.h
 )
 
 target_link_libraries(esp-fc-configurator PRIVATE

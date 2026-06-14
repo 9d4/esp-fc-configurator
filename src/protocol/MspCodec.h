@@ -1,6 +1,9 @@
 #pragma once
 
 #include "model/FcStatus.h"
+#include "model/FirmwareInfo.h"
+#include "model/RxConfig.h"
+#include "model/SensorData.h"
 
 #include <QByteArray>
 #include <QObject>
@@ -29,8 +32,8 @@ public:
         Attitude = 108,
         Status = 101,
         StatusEx = 150,
-        RxConfig = 44,
-        SetRxConfig = 45,
+        RxConfigCommand = 44,
+        SetRxConfigCommand = 45,
         EepromWrite = 250,
         Reboot = 68,
     };
@@ -38,8 +41,17 @@ public:
     explicit MspCodec(QObject *parent = nullptr);
 
     static QByteArray encodeV1(quint16 command, const QByteArray &payload = {});
+    static QByteArray encodeSetRxProvider(const RxConfig &config, quint8 provider);
     static QString commandName(quint16 command);
+    static FirmwareInfo parseApiVersion(const MspMessage &message, FirmwareInfo current = {});
+    static FirmwareInfo parseFcVariant(const MspMessage &message, FirmwareInfo current = {});
+    static FirmwareInfo parseFcVersion(const MspMessage &message, FirmwareInfo current = {});
+    static FirmwareInfo parseBoardInfo(const MspMessage &message, FirmwareInfo current = {});
+    static FirmwareInfo parseBuildInfo(const MspMessage &message, FirmwareInfo current = {});
     static FcStatus parseStatus(const MspMessage &message);
+    static RxConfig parseRxConfig(const MspMessage &message);
+    static AttitudeState parseAttitude(const MspMessage &message);
+    static RawImuState parseRawImu(const MspMessage &message);
 
     void consume(const QByteArray &bytes);
 

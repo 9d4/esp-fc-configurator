@@ -1,6 +1,8 @@
 #include "protocol/MspCodec.h"
 
-#include <QDataStream>
+#include <QStringList>
+
+#include <algorithm>
 
 namespace {
 quint16 readU16Le(const QByteArray &payload, int offset)
@@ -12,6 +14,11 @@ quint16 readU16Le(const QByteArray &payload, int offset)
         (static_cast<quint16>(static_cast<quint8>(payload[offset + 1])) << 8);
 }
 
+qint16 readI16Le(const QByteArray &payload, int offset)
+{
+    return static_cast<qint16>(readU16Le(payload, offset));
+}
+
 quint32 readU32Le(const QByteArray &payload, int offset)
 {
     if (offset + 4 > payload.size()) {
@@ -21,6 +28,15 @@ quint32 readU32Le(const QByteArray &payload, int offset)
         (static_cast<quint32>(static_cast<quint8>(payload[offset + 1])) << 8) |
         (static_cast<quint32>(static_cast<quint8>(payload[offset + 2])) << 16) |
         (static_cast<quint32>(static_cast<quint8>(payload[offset + 3])) << 24);
+}
+
+QString asciiString(const QByteArray &payload, int offset, int length)
+{
+    if (offset < 0 || length <= 0 || offset >= payload.size()) {
+        return {};
+    }
+    const qsizetype count = std::min<qsizetype>(length, payload.size() - offset);
+    return QString::fromLatin1(payload.mid(offset, count)).trimmed();
 }
 }
 
@@ -45,6 +61,26 @@ QByteArray MspCodec::encodeV1(quint16 command, const QByteArray &payload)
     return frame;
 }
 
+QByteArray MspCodec::encodeSetRxProvider(const RxConfig &config, quint8 provider)
+{
+    QByteArray payload = config.rawPayload;
+    if (payload.isEmpty()) {
+        payload.resize(12);
+        payload[1] = static_cast<char>(config.maxCheck & 0xff);
+        payload[2] = static_cast<char>((config.maxCheck >> 8) & 0xff);
+        payload[3] = static_cast<char>(config.midRc & 0xff);
+        payload[4] = static_cast<char>((config.midRc >> 8) & 0xff);
+        payload[5] = static_cast<char>(config.minCheck & 0xff);
+        payload[6] = static_cast<char>((config.minCheck >> 8) & 0xff);
+        payload[8] = static_cast<char>(config.minRc & 0xff);
+        payload[9] = static_cast<char>((config.minRc >> 8) & 0xff);
+        payload[10] = static_cast<char>(config.maxRc & 0xff);
+        payload[11] = static_cast<char>((config.maxRc >> 8) & 0xff);
+    }
+    payload[0] = static_cast<char>(provider);
+    return payload;
+}
+
 QString MspCodec::commandName(quint16 command)
 {
     switch (command) {
@@ -57,12 +93,63 @@ QString MspCodec::commandName(quint16 command)
     case Attitude: return QStringLiteral("MSP_ATTITUDE");
     case Status: return QStringLiteral("MSP_STATUS");
     case StatusEx: return QStringLiteral("MSP_STATUS_EX");
-    case RxConfig: return QStringLiteral("MSP_RX_CONFIG");
-    case SetRxConfig: return QStringLiteral("MSP_SET_RX_CONFIG");
+    case RxConfigCommand: return QStringLiteral("MSP_RX_CONFIG");
+    case SetRxConfigCommand: return QStringLiteral("MSP_SET_RX_CONFIG");
     case EepromWrite: return QStringLiteral("MSP_EEPROM_WRITE");
     case Reboot: return QStringLiteral("MSP_REBOOT");
     default: return QStringLiteral("MSP_%1").arg(command);
     }
+}
+
+FirmwareInfo MspCodec::parseApiVersion(const MspMessage &message, FirmwareInfo current)
+{
+    const QByteArray &p = message.payload;
+    if (p.size() >= 3) {
+        current.mspProtocol = static_cast<quint8>(p[0]);
+        current.apiMajor = static_cast<quint8>(p[1]);
+        current.apiMinor = static_cast<quint8>(p[2]);
+    }
+    return current;
+}
+
+FirmwareInfo MspCodec::parseFcVariant(const MspMessage &message, FirmwareInfo current)
+{
+    current.variant = QString::fromLatin1(message.payload).trimmed();
+    return current;
+}
+
+FirmwareInfo MspCodec::parseFcVersion(const MspMessage &message, FirmwareInfo current)
+{
+    const QByteArray &p = message.payload;
+    if (p.size() >= 3) {
+        current.version = QStringLiteral("%1.%2.%3")
+            .arg(static_cast<quint8>(p[0]))
+            .arg(static_cast<quint8>(p[1]))
+            .arg(static_cast<quint8>(p[2]));
+    }
+    return current;
+}
+
+FirmwareInfo MspCodec::parseBoardInfo(const MspMessage &message, FirmwareInfo current)
+{
+    const QByteArray &p = message.payload;
+    if (p.size() >= 4) {
+        current.board = QString::fromLatin1(p.left(4)).trimmed();
+    }
+    if (p.size() >= 9) {
+        const int targetLength = static_cast<quint8>(p[8]);
+        current.target = asciiString(p, 9, targetLength);
+    }
+    return current;
+}
+
+FirmwareInfo MspCodec::parseBuildInfo(const MspMessage &message, FirmwareInfo current)
+{
+    const QByteArray &p = message.payload;
+    current.buildDate = asciiString(p, 0, 11);
+    current.buildTime = asciiString(p, 11, 8);
+    current.gitRevision = asciiString(p, 19, 7);
+    return current;
 }
 
 FcStatus MspCodec::parseStatus(const MspMessage &message)
@@ -92,6 +179,54 @@ FcStatus MspCodec::parseStatus(const MspMessage &message)
     }
 
     return status;
+}
+
+RxConfig MspCodec::parseRxConfig(const MspMessage &message)
+{
+    RxConfig config;
+    const QByteArray &p = message.payload;
+    config.rawPayload = p;
+    if (p.size() >= 1) {
+        config.serialRxProvider = static_cast<quint8>(p[0]);
+    }
+    if (p.size() >= 12) {
+        config.maxCheck = readU16Le(p, 1);
+        config.midRc = readU16Le(p, 3);
+        config.minCheck = readU16Le(p, 5);
+        config.minRc = readU16Le(p, 8);
+        config.maxRc = readU16Le(p, 10);
+    }
+    return config;
+}
+
+AttitudeState MspCodec::parseAttitude(const MspMessage &message)
+{
+    AttitudeState attitude;
+    const QByteArray &p = message.payload;
+    if (p.size() < 6) {
+        return attitude;
+    }
+    attitude.rollDeg = static_cast<float>(readI16Le(p, 0)) / 10.0f;
+    attitude.pitchDeg = static_cast<float>(readI16Le(p, 2)) / 10.0f;
+    attitude.yawDeg = static_cast<float>(readI16Le(p, 4));
+    attitude.valid = true;
+    return attitude;
+}
+
+RawImuState MspCodec::parseRawImu(const MspMessage &message)
+{
+    RawImuState imu;
+    const QByteArray &p = message.payload;
+    if (p.size() < 18) {
+        return imu;
+    }
+    for (int i = 0; i < 3; ++i) {
+        imu.acc[i] = readI16Le(p, i * 2);
+        imu.gyro[i] = readI16Le(p, 6 + i * 2);
+        imu.mag[i] = readI16Le(p, 12 + i * 2);
+    }
+    imu.valid = true;
+    return imu;
 }
 
 void MspCodec::consume(const QByteArray &bytes)
