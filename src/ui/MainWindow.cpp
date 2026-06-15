@@ -39,11 +39,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     tabs->addTab(buildMotorsTab(), QStringLiteral("Motors"));
     tabs->addTab(buildPidTab(), QStringLiteral("PID"));
     tabs->addTab(buildFiltersTab(), QStringLiteral("Filters"));
-    tabs->addTab(buildPlaceholderTab(QStringLiteral("Rates"), {
-        QStringLiteral("Roll/pitch/yaw rate, super-rate, expo, limits"),
-        QStringLiteral("Throttle smoothing guidance through radio curves and mixer limit"),
-        QStringLiteral("Beginner preset for reduced sensitivity"),
-    }), QStringLiteral("Rates"));
+    tabs->addTab(buildRatesTab(), QStringLiteral("Rates"));
+    tabs->addTab(buildBlackboxTab(), QStringLiteral("Blackbox"));
     tabs->addTab(buildSensorsTab(), QStringLiteral("Sensors"));
     tabs->addTab(buildCliTab(), QStringLiteral("CLI"));
 
@@ -643,6 +640,240 @@ QWidget *MainWindow::buildFiltersTab()
     return page;
 }
 
+QWidget *MainWindow::buildRatesTab()
+{
+    auto *page = new QWidget(this);
+    auto *layout = new QVBoxLayout(page);
+
+    auto *typeBox = new QGroupBox(QStringLiteral("Rate Type"), page);
+    auto *typeForm = new QFormLayout(typeBox);
+    m_rateType = new QComboBox(typeBox);
+    m_rateType->addItems({
+        QStringLiteral("BETAFLIGHT"), QStringLiteral("RACEFLIGHT"), QStringLiteral("KISS"),
+        QStringLiteral("ACTUAL"), QStringLiteral("QUICK"),
+    });
+    typeForm->addRow(QStringLiteral("input_rate_type"), m_rateType);
+
+    auto *axisBox = new QGroupBox(QStringLiteral("Axis Rates"), page);
+    auto *axisGrid = new QGridLayout(axisBox);
+    const QStringList axes = {QStringLiteral("Roll"), QStringLiteral("Pitch"), QStringLiteral("Yaw")};
+    const QStringList columns = {QStringLiteral("Rate"), QStringLiteral("Super Rate"), QStringLiteral("Expo"), QStringLiteral("Limit")};
+    for (int column = 0; column < columns.size(); ++column) {
+        axisGrid->addWidget(new QLabel(columns[column], axisBox), 0, column + 1);
+    }
+    for (int row = 0; row < axes.size(); ++row) {
+        axisGrid->addWidget(new QLabel(axes[row], axisBox), row + 1, 0);
+        for (int column = 0; column < columns.size(); ++column) {
+            auto *spin = new QSpinBox(axisBox);
+            if (column == 0 || column == 1) {
+                spin->setRange(0, 200);
+            } else if (column == 2) {
+                spin->setRange(0, 100);
+            } else {
+                spin->setRange(0, 2000);
+            }
+            m_rate[row][column] = spin;
+            axisGrid->addWidget(spin, row + 1, column + 1);
+        }
+    }
+
+    const QStringList filterTypes = {
+        QStringLiteral("PT1"), QStringLiteral("BIQUAD"), QStringLiteral("PT2"), QStringLiteral("PT3"),
+        QStringLiteral("FO"), QStringLiteral("NONE"),
+    };
+    auto makeFilterCombo = [&filterTypes](QWidget *parent) {
+        auto *combo = new QComboBox(parent);
+        combo->addItems(filterTypes);
+        return combo;
+    };
+    auto makeHzSpin = [](QWidget *parent) {
+        auto *spin = new QSpinBox(parent);
+        spin->setRange(0, 500);
+        spin->setSuffix(QStringLiteral(" Hz"));
+        return spin;
+    };
+
+    auto *inputBox = new QGroupBox(QStringLiteral("Input Feel"), page);
+    auto *inputForm = new QFormLayout(inputBox);
+    m_inputDeadband = new QSpinBox(inputBox);
+    m_inputDeadband->setRange(0, 50);
+    m_inputLpfType = makeFilterCombo(inputBox);
+    m_inputLpfFreq = makeHzSpin(inputBox);
+    m_inputLpfFactor = new QSpinBox(inputBox);
+    m_inputLpfFactor->setRange(0, 100);
+    m_inputFfLpfType = makeFilterCombo(inputBox);
+    m_inputFfLpfFreq = makeHzSpin(inputBox);
+    inputForm->addRow(QStringLiteral("input_deadband"), m_inputDeadband);
+    inputForm->addRow(QStringLiteral("input_lpf_type"), m_inputLpfType);
+    inputForm->addRow(QStringLiteral("input_lpf_freq"), m_inputLpfFreq);
+    inputForm->addRow(QStringLiteral("input_lpf_factor"), m_inputLpfFactor);
+    inputForm->addRow(QStringLiteral("input_ff_lpf_type"), m_inputFfLpfType);
+    inputForm->addRow(QStringLiteral("input_ff_lpf_freq"), m_inputFfLpfFreq);
+
+    auto *throttleBox = new QGroupBox(QStringLiteral("Throttle Smoothing"), page);
+    auto *throttleForm = new QFormLayout(throttleBox);
+    m_rateThrottleLimitType = new QComboBox(throttleBox);
+    m_rateThrottleLimitType->addItems({QStringLiteral("NONE"), QStringLiteral("SCALE"), QStringLiteral("CLIP")});
+    m_rateThrottleLimitPercent = new QSpinBox(throttleBox);
+    m_rateThrottleLimitPercent->setRange(1, 100);
+    m_rateThrottleLimitPercent->setSuffix(QStringLiteral(" %"));
+    m_rateMinThrottle = new QSpinBox(throttleBox);
+    m_rateMinThrottle->setRange(900, 1200);
+    throttleForm->addRow(QStringLiteral("mixer_throttle_limit_type"), m_rateThrottleLimitType);
+    throttleForm->addRow(QStringLiteral("mixer_throttle_limit_percent"), m_rateThrottleLimitPercent);
+    throttleForm->addRow(QStringLiteral("output_min_throttle"), m_rateMinThrottle);
+
+    auto *columnsLayout = new QHBoxLayout();
+    auto *left = new QVBoxLayout();
+    auto *right = new QVBoxLayout();
+    left->addWidget(typeBox);
+    left->addWidget(axisBox);
+    right->addWidget(inputBox);
+    right->addWidget(throttleBox);
+    columnsLayout->addLayout(left, 2);
+    columnsLayout->addLayout(right, 1);
+
+    m_rateValidation = new QLabel(QStringLiteral("Load a config dump to validate rate settings."), page);
+    m_rateValidation->setWordWrap(true);
+
+    auto *buttons = new QHBoxLayout();
+    auto *load = new QPushButton(QStringLiteral("Load Dump"), page);
+    auto *beginner = new QPushButton(QStringLiteral("Beginner Soft"), page);
+    auto *noFlips = new QPushButton(QStringLiteral("No Flips"), page);
+    auto *acro = new QPushButton(QStringLiteral("Acro Normal"), page);
+    auto *smoothThrottle = new QPushButton(QStringLiteral("Smooth Throttle"), page);
+    auto *stage = new QPushButton(QStringLiteral("Stage Rate Fields"), page);
+    auto *write = new QPushButton(QStringLiteral("Write to FC && Reboot"), page);
+    buttons->addWidget(load);
+    buttons->addWidget(beginner);
+    buttons->addWidget(noFlips);
+    buttons->addWidget(acro);
+    buttons->addWidget(smoothThrottle);
+    buttons->addWidget(stage);
+    buttons->addWidget(write);
+    buttons->addStretch();
+
+    auto *note = new QLabel(QStringLiteral(
+        "ESP-FC does not expose throttle expo. Use SCALE throttle limiting here for coarse smoothing; use an EdgeTX throttle curve for detailed shaping."), page);
+    note->setWordWrap(true);
+
+    layout->addLayout(columnsLayout);
+    layout->addWidget(note);
+    layout->addWidget(m_rateValidation);
+    layout->addLayout(buttons);
+    layout->addStretch();
+
+    connect(load, &QPushButton::clicked, this, &MainWindow::loadConfigDump);
+    connect(beginner, &QPushButton::clicked, this, &MainWindow::applyRateBeginnerPreset);
+    connect(noFlips, &QPushButton::clicked, this, &MainWindow::applyRateNoFlipsPreset);
+    connect(acro, &QPushButton::clicked, this, &MainWindow::applyRateAcroNormalPreset);
+    connect(smoothThrottle, &QPushButton::clicked, this, &MainWindow::applySmoothThrottlePreset);
+    connect(stage, &QPushButton::clicked, this, &MainWindow::stageRateFields);
+    connect(write, &QPushButton::clicked, this, &MainWindow::writeSaveReboot);
+    return page;
+}
+
+QWidget *MainWindow::buildBlackboxTab()
+{
+    auto *page = new QWidget(this);
+    auto *layout = new QVBoxLayout(page);
+
+    auto *configBox = new QGroupBox(QStringLiteral("Blackbox Configuration"), page);
+    auto *configForm = new QFormLayout(configBox);
+    m_blackboxDev = new QComboBox(configBox);
+    m_blackboxDev->addItems({QStringLiteral("NONE"), QStringLiteral("FLASH"), QStringLiteral("SDCARD"), QStringLiteral("SERIAL")});
+    m_blackboxMode = new QComboBox(configBox);
+    m_blackboxMode->addItems({QStringLiteral("NORMAL")});
+    m_blackboxRate = new QSpinBox(configBox);
+    m_blackboxRate->setRange(1, 256);
+    configForm->addRow(QStringLiteral("blackbox_dev"), m_blackboxDev);
+    configForm->addRow(QStringLiteral("blackbox_mode"), m_blackboxMode);
+    configForm->addRow(QStringLiteral("blackbox_rate"), m_blackboxRate);
+
+    auto *fieldsBox = new QGroupBox(QStringLiteral("Logged Fields"), page);
+    auto *fieldsGrid = new QGridLayout(fieldsBox);
+    const QStringList labels = {
+        QStringLiteral("Accelerometer"), QStringLiteral("Altitude"), QStringLiteral("Battery"), QStringLiteral("Debug"),
+        QStringLiteral("GPS"), QStringLiteral("Gyro"), QStringLiteral("Raw Gyro"), QStringLiteral("Magnetometer"),
+        QStringLiteral("Motors"), QStringLiteral("PID"), QStringLiteral("RC"), QStringLiteral("RPM"),
+        QStringLiteral("RSSI"), QStringLiteral("Setpoint"),
+    };
+    for (int i = 0; i < labels.size(); ++i) {
+        m_blackboxFields[i] = new QCheckBox(labels[i], fieldsBox);
+        fieldsGrid->addWidget(m_blackboxFields[i], i / 2, i % 2);
+    }
+
+    auto *serialBox = new QGroupBox(QStringLiteral("Serial Blackbox"), page);
+    auto *serialForm = new QFormLayout(serialBox);
+    m_blackboxSerialPort = new QComboBox(serialBox);
+    m_blackboxSerialPort->addItems({
+        QStringLiteral("None"), QStringLiteral("serial_0"), QStringLiteral("serial_1"),
+        QStringLiteral("serial_2"), QStringLiteral("serial_soft_0"), QStringLiteral("serial_usb"),
+    });
+    serialForm->addRow(QStringLiteral("Port helper"), m_blackboxSerialPort);
+    auto *serialNote = new QLabel(QStringLiteral(
+        "This first pass does not rewrite serial functions automatically. If blackbox_dev is SERIAL, ensure one serial port function includes 128 (BLACKBOX) and does not conflict with RX_SERIAL 64."), serialBox);
+    serialNote->setWordWrap(true);
+    serialForm->addRow(QStringLiteral("Note"), serialNote);
+
+    auto *statusBox = new QGroupBox(QStringLiteral("Status / Validation"), page);
+    auto *statusLayout = new QVBoxLayout(statusBox);
+    m_blackboxStorage = new QLabel(QStringLiteral("Storage status not queried in this first pass."), statusBox);
+    m_blackboxStorage->setWordWrap(true);
+    m_blackboxValidation = new QLabel(QStringLiteral("Load a config dump to validate blackbox settings."), statusBox);
+    m_blackboxValidation->setWordWrap(true);
+    statusLayout->addWidget(m_blackboxStorage);
+    statusLayout->addWidget(m_blackboxValidation);
+
+    auto *columns = new QHBoxLayout();
+    auto *left = new QVBoxLayout();
+    auto *right = new QVBoxLayout();
+    left->addWidget(configBox);
+    left->addWidget(serialBox);
+    right->addWidget(fieldsBox);
+    right->addWidget(statusBox);
+    columns->addLayout(left, 1);
+    columns->addLayout(right, 2);
+
+    auto *buttons = new QHBoxLayout();
+    auto *load = new QPushButton(QStringLiteral("Load Dump"), page);
+    auto *off = new QPushButton(QStringLiteral("Blackbox Off"), page);
+    auto *basic = new QPushButton(QStringLiteral("Basic Logging"), page);
+    auto *debug = new QPushButton(QStringLiteral("Gyro/PID Debug"), page);
+    auto *full = new QPushButton(QStringLiteral("Full Logging"), page);
+    auto *serial = new QPushButton(QStringLiteral("Serial Blackbox"), page);
+    auto *stage = new QPushButton(QStringLiteral("Stage Blackbox Fields"), page);
+    auto *write = new QPushButton(QStringLiteral("Write to FC && Reboot"), page);
+    buttons->addWidget(load);
+    buttons->addWidget(off);
+    buttons->addWidget(basic);
+    buttons->addWidget(debug);
+    buttons->addWidget(full);
+    buttons->addWidget(serial);
+    buttons->addWidget(stage);
+    buttons->addWidget(write);
+    buttons->addStretch();
+
+    auto *note = new QLabel(QStringLiteral(
+        "Blackbox settings are staged through CLI parameters. Flash erase and log download are intentionally deferred until storage MSP handling is added safely."), page);
+    note->setWordWrap(true);
+
+    layout->addLayout(columns);
+    layout->addWidget(note);
+    layout->addLayout(buttons);
+    layout->addStretch();
+
+    connect(load, &QPushButton::clicked, this, &MainWindow::loadConfigDump);
+    connect(off, &QPushButton::clicked, this, &MainWindow::applyBlackboxOffPreset);
+    connect(basic, &QPushButton::clicked, this, &MainWindow::applyBlackboxBasicPreset);
+    connect(debug, &QPushButton::clicked, this, &MainWindow::applyBlackboxDebugPreset);
+    connect(full, &QPushButton::clicked, this, &MainWindow::applyBlackboxFullPreset);
+    connect(serial, &QPushButton::clicked, this, &MainWindow::applyBlackboxSerialPreset);
+    connect(stage, &QPushButton::clicked, this, &MainWindow::stageBlackboxFields);
+    connect(write, &QPushButton::clicked, this, &MainWindow::writeSaveReboot);
+    return page;
+}
+
 QWidget *MainWindow::buildSensorsTab()
 {
     auto *page = new QWidget(this);
@@ -1101,6 +1332,185 @@ void MainWindow::applyFilterLowLatencyPreset()
     updateConfigUi();
 }
 
+void MainWindow::stageRateFields()
+{
+    m_config.setValue(QStringLiteral("input_rate_type"), m_rateType->currentText());
+
+    const QStringList axes = {QStringLiteral("roll"), QStringLiteral("pitch"), QStringLiteral("yaw")};
+    const QStringList fields = {QStringLiteral("rate"), QStringLiteral("srate"), QStringLiteral("expo"), QStringLiteral("limit")};
+    for (int row = 0; row < axes.size(); ++row) {
+        for (int col = 0; col < fields.size(); ++col) {
+            m_config.setInt(QStringLiteral("input_%1_%2").arg(axes.at(row), fields.at(col)), m_rate[row][col]->value());
+        }
+    }
+
+    m_config.setInt(QStringLiteral("input_deadband"), m_inputDeadband->value());
+    m_config.setValue(QStringLiteral("input_lpf_type"), m_inputLpfType->currentText());
+    m_config.setInt(QStringLiteral("input_lpf_freq"), m_inputLpfFreq->value());
+    m_config.setInt(QStringLiteral("input_lpf_factor"), m_inputLpfFactor->value());
+    m_config.setValue(QStringLiteral("input_ff_lpf_type"), m_inputFfLpfType->currentText());
+    m_config.setInt(QStringLiteral("input_ff_lpf_freq"), m_inputFfLpfFreq->value());
+    m_config.setValue(QStringLiteral("mixer_throttle_limit_type"), m_rateThrottleLimitType->currentText());
+    m_config.setInt(QStringLiteral("mixer_throttle_limit_percent"), m_rateThrottleLimitPercent->value());
+    m_config.setInt(QStringLiteral("output_min_throttle"), m_rateMinThrottle->value());
+    appendLog(QStringLiteral("Rate fields staged. Use Write to FC && Reboot to write them to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyRateBeginnerPreset()
+{
+    m_config.setInt(QStringLiteral("input_roll_expo"), 30);
+    m_config.setInt(QStringLiteral("input_pitch_expo"), 30);
+    m_config.setInt(QStringLiteral("input_yaw_expo"), 20);
+    m_config.setInt(QStringLiteral("input_roll_limit"), 250);
+    m_config.setInt(QStringLiteral("input_pitch_limit"), 250);
+    appendLog(QStringLiteral("Beginner Soft rate preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyRateNoFlipsPreset()
+{
+    m_config.setInt(QStringLiteral("input_roll_expo"), 35);
+    m_config.setInt(QStringLiteral("input_pitch_expo"), 35);
+    m_config.setInt(QStringLiteral("input_yaw_expo"), 20);
+    m_config.setInt(QStringLiteral("input_roll_limit"), 200);
+    m_config.setInt(QStringLiteral("input_pitch_limit"), 200);
+    m_config.setInt(QStringLiteral("input_yaw_limit"), 250);
+    appendLog(QStringLiteral("No Flips rate preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyRateAcroNormalPreset()
+{
+    m_config.setValue(QStringLiteral("input_rate_type"), QStringLiteral("ACTUAL"));
+    m_config.setInt(QStringLiteral("input_roll_rate"), 20);
+    m_config.setInt(QStringLiteral("input_roll_srate"), 40);
+    m_config.setInt(QStringLiteral("input_roll_expo"), 0);
+    m_config.setInt(QStringLiteral("input_roll_limit"), 1998);
+    m_config.setInt(QStringLiteral("input_pitch_rate"), 20);
+    m_config.setInt(QStringLiteral("input_pitch_srate"), 40);
+    m_config.setInt(QStringLiteral("input_pitch_expo"), 0);
+    m_config.setInt(QStringLiteral("input_pitch_limit"), 1998);
+    m_config.setInt(QStringLiteral("input_yaw_rate"), 30);
+    m_config.setInt(QStringLiteral("input_yaw_srate"), 36);
+    m_config.setInt(QStringLiteral("input_yaw_expo"), 0);
+    m_config.setInt(QStringLiteral("input_yaw_limit"), 1998);
+    m_config.setInt(QStringLiteral("input_deadband"), 3);
+    appendLog(QStringLiteral("Acro Normal rate preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applySmoothThrottlePreset()
+{
+    m_config.setValue(QStringLiteral("mixer_throttle_limit_type"), QStringLiteral("SCALE"));
+    m_config.setInt(QStringLiteral("mixer_throttle_limit_percent"), 80);
+    appendLog(QStringLiteral("Smooth Throttle preset staged. Use an EdgeTX throttle curve for detailed shaping."));
+    updateConfigUi();
+}
+
+void MainWindow::stageBlackboxFields()
+{
+    static const QStringList fieldNames = {
+        QStringLiteral("blackbox_log_acc"), QStringLiteral("blackbox_log_alt"), QStringLiteral("blackbox_log_bat"),
+        QStringLiteral("blackbox_log_debug"), QStringLiteral("blackbox_log_gps"), QStringLiteral("blackbox_log_gyro"),
+        QStringLiteral("blackbox_log_gyro_raw"), QStringLiteral("blackbox_log_mag"), QStringLiteral("blackbox_log_motor"),
+        QStringLiteral("blackbox_log_pid"), QStringLiteral("blackbox_log_rc"), QStringLiteral("blackbox_log_rpm"),
+        QStringLiteral("blackbox_log_rssi"), QStringLiteral("blackbox_log_sp"),
+    };
+
+    m_config.setValue(QStringLiteral("blackbox_dev"), m_blackboxDev->currentText());
+    m_config.setValue(QStringLiteral("blackbox_mode"), m_blackboxMode->currentText());
+    m_config.setInt(QStringLiteral("blackbox_rate"), m_blackboxRate->value());
+    for (int i = 0; i < fieldNames.size(); ++i) {
+        m_config.setBool(fieldNames[i], m_blackboxFields[i] && m_blackboxFields[i]->isChecked());
+    }
+    appendLog(QStringLiteral("Blackbox fields staged. Use Write to FC && Reboot to write them to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyBlackboxOffPreset()
+{
+    m_config.setValue(QStringLiteral("blackbox_dev"), QStringLiteral("NONE"));
+    m_config.setValue(QStringLiteral("blackbox_mode"), QStringLiteral("NORMAL"));
+    m_config.setInt(QStringLiteral("blackbox_rate"), 32);
+    appendLog(QStringLiteral("Blackbox Off preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyBlackboxBasicPreset()
+{
+    m_config.setValue(QStringLiteral("blackbox_dev"), QStringLiteral("FLASH"));
+    m_config.setValue(QStringLiteral("blackbox_mode"), QStringLiteral("NORMAL"));
+    m_config.setInt(QStringLiteral("blackbox_rate"), 32);
+    m_config.setBool(QStringLiteral("blackbox_log_acc"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_alt"), false);
+    m_config.setBool(QStringLiteral("blackbox_log_bat"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_debug"), false);
+    m_config.setBool(QStringLiteral("blackbox_log_gps"), false);
+    m_config.setBool(QStringLiteral("blackbox_log_gyro"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_gyro_raw"), false);
+    m_config.setBool(QStringLiteral("blackbox_log_mag"), false);
+    m_config.setBool(QStringLiteral("blackbox_log_motor"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_pid"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_rc"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_rpm"), false);
+    m_config.setBool(QStringLiteral("blackbox_log_rssi"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_sp"), true);
+    appendLog(QStringLiteral("Basic Blackbox preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyBlackboxDebugPreset()
+{
+    m_config.setValue(QStringLiteral("blackbox_dev"), QStringLiteral("FLASH"));
+    m_config.setValue(QStringLiteral("blackbox_mode"), QStringLiteral("NORMAL"));
+    m_config.setInt(QStringLiteral("blackbox_rate"), 16);
+    m_config.setBool(QStringLiteral("blackbox_log_acc"), false);
+    m_config.setBool(QStringLiteral("blackbox_log_alt"), false);
+    m_config.setBool(QStringLiteral("blackbox_log_bat"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_debug"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_gps"), false);
+    m_config.setBool(QStringLiteral("blackbox_log_gyro"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_gyro_raw"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_mag"), false);
+    m_config.setBool(QStringLiteral("blackbox_log_motor"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_pid"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_rc"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_rpm"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_rssi"), true);
+    m_config.setBool(QStringLiteral("blackbox_log_sp"), true);
+    appendLog(QStringLiteral("Gyro/PID Debug Blackbox preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyBlackboxFullPreset()
+{
+    static const QStringList fieldNames = {
+        QStringLiteral("blackbox_log_acc"), QStringLiteral("blackbox_log_alt"), QStringLiteral("blackbox_log_bat"),
+        QStringLiteral("blackbox_log_debug"), QStringLiteral("blackbox_log_gps"), QStringLiteral("blackbox_log_gyro"),
+        QStringLiteral("blackbox_log_gyro_raw"), QStringLiteral("blackbox_log_mag"), QStringLiteral("blackbox_log_motor"),
+        QStringLiteral("blackbox_log_pid"), QStringLiteral("blackbox_log_rc"), QStringLiteral("blackbox_log_rpm"),
+        QStringLiteral("blackbox_log_rssi"), QStringLiteral("blackbox_log_sp"),
+    };
+    m_config.setValue(QStringLiteral("blackbox_dev"), QStringLiteral("FLASH"));
+    m_config.setValue(QStringLiteral("blackbox_mode"), QStringLiteral("NORMAL"));
+    m_config.setInt(QStringLiteral("blackbox_rate"), 16);
+    for (const QString &name : fieldNames) {
+        m_config.setBool(name, true);
+    }
+    appendLog(QStringLiteral("Full Blackbox preset staged. Use Write to FC && Reboot to write it to the FC."));
+    updateConfigUi();
+}
+
+void MainWindow::applyBlackboxSerialPreset()
+{
+    m_config.setValue(QStringLiteral("blackbox_dev"), QStringLiteral("SERIAL"));
+    m_config.setValue(QStringLiteral("blackbox_mode"), QStringLiteral("NORMAL"));
+    m_config.setInt(QStringLiteral("blackbox_rate"), 16);
+    appendLog(QStringLiteral("Serial Blackbox preset staged. Check that one serial port function includes 128 (BLACKBOX)."));
+    updateConfigUi();
+}
+
 void MainWindow::startSensorPolling()
 {
     if (!m_transport || !m_transport->isOpen()) {
@@ -1300,6 +1710,10 @@ void MainWindow::updateConfigUi()
     updatePidValidation();
     updateFiltersUi();
     updateFilterValidation();
+    updateRatesUi();
+    updateRateValidation();
+    updateBlackboxUi();
+    updateBlackboxValidation();
     updateSensorUi();
     syncGyroAlignUiFromConfig();
     if (!m_setupValidation) {
@@ -1506,6 +1920,142 @@ void MainWindow::updateFilterValidation()
     }
     checks << QStringLiteral("INFO: lower cutoff means stronger filtering and more delay.");
     m_filterValidation->setText(checks.join(QStringLiteral("\n")));
+}
+
+void MainWindow::updateRatesUi()
+{
+    if (!m_rateType) {
+        return;
+    }
+    auto setCombo = [](QComboBox *combo, const QString &value) {
+        const int index = combo->findText(value);
+        if (index >= 0) {
+            combo->setCurrentIndex(index);
+        }
+    };
+
+    setCombo(m_rateType, m_config.value(QStringLiteral("input_rate_type"), QStringLiteral("ACTUAL")));
+
+    const QStringList axes = {QStringLiteral("roll"), QStringLiteral("pitch"), QStringLiteral("yaw")};
+    const QStringList fields = {QStringLiteral("rate"), QStringLiteral("srate"), QStringLiteral("expo"), QStringLiteral("limit")};
+    const int defaults[3][4] = {
+        {20, 40, 0, 1998},
+        {20, 40, 0, 1998},
+        {30, 36, 0, 1998},
+    };
+    for (int row = 0; row < axes.size(); ++row) {
+        for (int col = 0; col < fields.size(); ++col) {
+            m_rate[row][col]->setValue(m_config.intValue(QStringLiteral("input_%1_%2").arg(axes.at(row), fields.at(col)), defaults[row][col]));
+        }
+    }
+
+    m_inputDeadband->setValue(m_config.intValue(QStringLiteral("input_deadband"), 3));
+    setCombo(m_inputLpfType, m_config.value(QStringLiteral("input_lpf_type"), QStringLiteral("PT3")));
+    m_inputLpfFreq->setValue(m_config.intValue(QStringLiteral("input_lpf_freq"), 0));
+    m_inputLpfFactor->setValue(m_config.intValue(QStringLiteral("input_lpf_factor"), 50));
+    setCombo(m_inputFfLpfType, m_config.value(QStringLiteral("input_ff_lpf_type"), QStringLiteral("PT3")));
+    m_inputFfLpfFreq->setValue(m_config.intValue(QStringLiteral("input_ff_lpf_freq"), 0));
+    setCombo(m_rateThrottleLimitType, m_config.value(QStringLiteral("mixer_throttle_limit_type"), QStringLiteral("NONE")));
+    m_rateThrottleLimitPercent->setValue(m_config.intValue(QStringLiteral("mixer_throttle_limit_percent"), 100));
+    m_rateMinThrottle->setValue(m_config.intValue(QStringLiteral("output_min_throttle"), 1070));
+}
+
+void MainWindow::updateRateValidation()
+{
+    if (!m_rateValidation) {
+        return;
+    }
+    QStringList checks;
+    auto mark = [](bool ok, const QString &label) {
+        return QStringLiteral("%1 %2").arg(ok ? QStringLiteral("OK:") : QStringLiteral("WARN:"), label);
+    };
+
+    const QStringList axes = {QStringLiteral("roll"), QStringLiteral("pitch"), QStringLiteral("yaw")};
+    bool axesHaveCommand = false;
+    for (int row = 0; row < axes.size(); ++row) {
+        const QString axis = axes.at(row);
+        const int rate = m_config.intValue(QStringLiteral("input_%1_rate").arg(axis), m_rate[row][0] ? m_rate[row][0]->value() : 0);
+        const int superRate = m_config.intValue(QStringLiteral("input_%1_srate").arg(axis), m_rate[row][1] ? m_rate[row][1]->value() : 0);
+        const int expo = m_config.intValue(QStringLiteral("input_%1_expo").arg(axis), m_rate[row][2] ? m_rate[row][2]->value() : 0);
+        const int limit = m_config.intValue(QStringLiteral("input_%1_limit").arg(axis), m_rate[row][3] ? m_rate[row][3]->value() : 0);
+        axesHaveCommand = axesHaveCommand || rate > 0 || superRate > 0;
+        checks << mark(limit >= 150, QStringLiteral("%1 limit allows usable authority").arg(axis));
+        checks << mark(expo <= 60, QStringLiteral("%1 expo is not excessive").arg(axis));
+    }
+
+    checks << mark(axesHaveCommand, QStringLiteral("at least one rate/super-rate value is non-zero"));
+    checks << mark(m_config.intValue(QStringLiteral("input_deadband"), m_inputDeadband ? m_inputDeadband->value() : 0) <= 10, QStringLiteral("input deadband is not too wide"));
+    const QString throttleLimitType = m_config.value(QStringLiteral("mixer_throttle_limit_type"), m_rateThrottleLimitType ? m_rateThrottleLimitType->currentText() : QStringLiteral("NONE"));
+    checks << mark(throttleLimitType != QStringLiteral("CLIP"), QStringLiteral("throttle limit uses smooth SCALE/NONE, not abrupt CLIP"));
+    checks << mark(m_config.intValue(QStringLiteral("mixer_throttle_limit_percent"), m_rateThrottleLimitPercent ? m_rateThrottleLimitPercent->value() : 100) >= 50, QStringLiteral("throttle limit remains above 50%"));
+    checks << QStringLiteral("INFO: ESP-FC has no throttle expo; use an EdgeTX throttle curve for detailed shaping.");
+    m_rateValidation->setText(checks.join(QStringLiteral("\n")));
+}
+
+void MainWindow::updateBlackboxUi()
+{
+    if (!m_blackboxDev) return;
+    auto setCombo = [](QComboBox *combo, const QString &value) {
+        const int index = combo->findText(value);
+        if (index >= 0) combo->setCurrentIndex(index);
+    };
+    static const QStringList fields = {
+        QStringLiteral("blackbox_log_acc"), QStringLiteral("blackbox_log_alt"), QStringLiteral("blackbox_log_bat"), QStringLiteral("blackbox_log_debug"),
+        QStringLiteral("blackbox_log_gps"), QStringLiteral("blackbox_log_gyro"), QStringLiteral("blackbox_log_gyro_raw"), QStringLiteral("blackbox_log_mag"),
+        QStringLiteral("blackbox_log_motor"), QStringLiteral("blackbox_log_pid"), QStringLiteral("blackbox_log_rc"), QStringLiteral("blackbox_log_rpm"),
+        QStringLiteral("blackbox_log_rssi"), QStringLiteral("blackbox_log_sp"),
+    };
+    setCombo(m_blackboxDev, m_config.value(QStringLiteral("blackbox_dev"), QStringLiteral("NONE")));
+    setCombo(m_blackboxMode, m_config.value(QStringLiteral("blackbox_mode"), QStringLiteral("NORMAL")));
+    m_blackboxRate->setValue(m_config.intValue(QStringLiteral("blackbox_rate"), 32));
+    for (int i = 0; i < fields.size(); ++i) {
+        if (m_blackboxFields[i]) m_blackboxFields[i]->setChecked(m_config.boolValue(fields.at(i), true));
+    }
+    QString selectedPort = QStringLiteral("None");
+    const QStringList ports = {QStringLiteral("serial_0"), QStringLiteral("serial_1"), QStringLiteral("serial_2"), QStringLiteral("serial_soft_0"), QStringLiteral("serial_usb")};
+    for (const QString &port : ports) {
+        bool ok = false;
+        const int mask = m_config.values(port).value(0).toInt(&ok);
+        if (ok && (mask & 128)) { selectedPort = port; break; }
+    }
+    setCombo(m_blackboxSerialPort, selectedPort);
+    m_blackboxStorage->setText(QStringLiteral("Storage status not queried in this first pass."));
+}
+
+void MainWindow::updateBlackboxValidation()
+{
+    if (!m_blackboxValidation) return;
+    static const QStringList fields = {
+        QStringLiteral("blackbox_log_acc"), QStringLiteral("blackbox_log_alt"), QStringLiteral("blackbox_log_bat"), QStringLiteral("blackbox_log_debug"),
+        QStringLiteral("blackbox_log_gps"), QStringLiteral("blackbox_log_gyro"), QStringLiteral("blackbox_log_gyro_raw"), QStringLiteral("blackbox_log_mag"),
+        QStringLiteral("blackbox_log_motor"), QStringLiteral("blackbox_log_pid"), QStringLiteral("blackbox_log_rc"), QStringLiteral("blackbox_log_rpm"),
+        QStringLiteral("blackbox_log_rssi"), QStringLiteral("blackbox_log_sp"),
+    };
+    QStringList checks;
+    auto mark = [](bool ok, const QString &label) { return QStringLiteral("%1 %2").arg(ok ? QStringLiteral("OK:") : QStringLiteral("WARN:"), label); };
+    const QString dev = m_config.value(QStringLiteral("blackbox_dev"), m_blackboxDev ? m_blackboxDev->currentText() : QStringLiteral("NONE"));
+    const int rate = m_config.intValue(QStringLiteral("blackbox_rate"), m_blackboxRate ? m_blackboxRate->value() : 32);
+    int enabledFields = 0;
+    for (int i = 0; i < fields.size(); ++i) enabledFields += m_config.boolValue(fields.at(i), m_blackboxFields[i] && m_blackboxFields[i]->isChecked()) ? 1 : 0;
+    checks << mark(dev != QStringLiteral("NONE"), dev == QStringLiteral("NONE") ? QStringLiteral("blackbox logging is disabled") : QStringLiteral("blackbox device is selected"));
+    checks << mark(dev == QStringLiteral("NONE") || enabledFields > 0, QStringLiteral("at least one blackbox field is enabled"));
+    checks << mark(rate >= 8, QStringLiteral("blackbox rate is not extremely high"));
+    checks << mark(!(enabledFields >= 12 && rate < 16), QStringLiteral("full/heavy logging is not combined with a very high rate"));
+    const QStringList ports = {QStringLiteral("serial_0"), QStringLiteral("serial_1"), QStringLiteral("serial_2"), QStringLiteral("serial_soft_0"), QStringLiteral("serial_usb")};
+    bool hasBlackboxSerial = false;
+    bool conflictsRx = false;
+    for (const QString &port : ports) {
+        bool ok = false;
+        const int mask = m_config.values(port).value(0).toInt(&ok);
+        if (ok && (mask & 128)) { hasBlackboxSerial = true; conflictsRx = conflictsRx || (mask & 64); }
+    }
+    if (dev == QStringLiteral("SERIAL")) {
+        checks << mark(hasBlackboxSerial, QStringLiteral("one serial port has BLACKBOX function 128"));
+        checks << mark(!conflictsRx, QStringLiteral("BLACKBOX is not sharing a port with RX_SERIAL"));
+    }
+    if (dev == QStringLiteral("FLASH") || dev == QStringLiteral("SDCARD")) checks << QStringLiteral("INFO: storage summary/download are deferred until safe MSP storage handling is added.");
+    checks << QStringLiteral("INFO: erase/download actions are intentionally not implemented in this first pass.");
+    m_blackboxValidation->setText(checks.join(QStringLiteral("\n")));
 }
 
 void MainWindow::updateSensorUi()
